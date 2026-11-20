@@ -1,0 +1,24 @@
+# Generated build and release output
+/build/
+/dist/
+
+# Fetched SDKs, archives, and generated compatibility headers
+/third_party/
+
+# .NET build output
+**/bin/
+**/obj/
+
+# Root scratch objects and logs
+/*.obj
+*.log
+/.write-probe
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Visual Studio
+/.vs/
+*.user
+*.suo

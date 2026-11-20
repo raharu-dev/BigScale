@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>BigScale</AssemblyName>
+    <RootNamespace>BigScale</RootNamespace>
+    <Version>1.0.0</Version>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <!-- Portable symbols so the diagnostics artifact has managed data; they are never installed. -->
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+    <!-- GameDir resolution: explicit property, then BIGSCALE_GAME_DIR. Nothing is machine-specific. -->
+    <GameDir Condition="'$(GameDir)' == ''">$(BIGSCALE_GAME_DIR)</GameDir>
+  </PropertyGroup>
+
+  <Target Name="RequireGameAssemblies" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(GameDir)/BepInEx/interop/Assembly-CSharp.dll')"
+           Text="Set GameDir (or BIGSCALE_GAME_DIR) to a Big Walk installation that has completed one BepInEx IL2CPP launch. Game assemblies are never redistributed." />
+    <Error Condition="!Exists('$(GameDir)/BepInEx/interop/Unity.RenderPipelines.Universal.Runtime.dll')"
+           Text="URP interop assemblies are missing under '$(GameDir)/BepInEx/interop'. Launch the game once with BepInEx so it generates them." />
+    <Error Condition="!Exists('$(GameDir)/BepInEx/core/0Harmony.dll')"
+           Text="BepInEx core assemblies are missing under '$(GameDir)/BepInEx/core'." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="$(GameDir)\BepInEx\core\*.dll">
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="$(GameDir)\BepInEx\interop\*.dll">
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

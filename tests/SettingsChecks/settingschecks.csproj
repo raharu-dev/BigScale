@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>settingschecks</AssemblyName>
+    <RootNamespace>BigScale.Checks</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- GameDir resolution: explicit property, then BIGSCALE_GAME_DIR. Nothing is machine-specific. -->
+    <GameDir Condition="'$(GameDir)' == ''">$(BIGSCALE_GAME_DIR)</GameDir>
+  </PropertyGroup>
+
+  <Target Name="RequireGameAssemblies" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(GameDir)/BepInEx/core/BepInEx.Core.dll')"
+           Text="Set GameDir (or BIGSCALE_GAME_DIR) to a Big Walk installation that has completed one BepInEx IL2CPP launch." />
+    <Error Condition="!Exists('$(GameDir)/BepInEx/core/SemanticVersioning.dll')"
+           Text="BepInEx core assemblies are incomplete under '$(GameDir)/BepInEx/core'." />
+    <Error Condition="!Exists('$(GameDir)/BepInEx/interop/UnityEngine.CoreModule.dll')"
+           Text="Unity interop assemblies are missing under '$(GameDir)/BepInEx/interop'." />
+  </Target>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../../src/managed/ModSettings.cs" />
+    <Compile Include="../../src/managed/Core/SettingsFileText.cs" />
+    <Compile Include="../../src/managed/Core/UpscalingModes.cs" />
+  </ItemGroup>
+
+  <!-- Only the assemblies the settings surface needs. The IL2CPP chainloader assembly, which owns the
+       removed shortcut type, is deliberately absent: binding must work without it. -->
+  <ItemGroup>
+    <Reference Include="BepInEx.Core">
+      <HintPath>$(GameDir)\BepInEx\core\BepInEx.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="SemanticVersioning">
+      <HintPath>$(GameDir)\BepInEx\core\SemanticVersioning.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GameDir)\BepInEx\interop\UnityEngine.CoreModule.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
