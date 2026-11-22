@@ -1,7 +1,8 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Builds BigScale into dist/ and packs dist/BigScale.zip and dist/BigScale-diagnostics.zip.
+  Builds BigScale into dist/ and packs the Thunderstore-ready dist/BigScale.zip and
+  dist/BigScale-diagnostics.zip.
 
 .DESCRIPTION
   Compiles the native bridge with the pinned Visual Studio CMake generator and the managed plugin
@@ -9,6 +10,8 @@
   README.txt and _ADDITIONAL_PROVIDERS.txt. The combined notice is composed from docs/licenses/ and
   third_party/, and the staged payload is checked against its release contract: nine binaries and
   those four text files.
+  The archive root carries the 13-file plugin payload plus manifest.json, icon.png, README.md and
+  CHANGELOG.md, the layout Thunderstore and r2modman expect.
   Game, BepInEx, interop, Big Walk VR and Big Visuals assemblies are never copied, and neither are
   the Streamline runtimes: that provider is not selectable in this release.
 #>
@@ -244,6 +247,49 @@ if ($nativeOutput -and $managedOutput) {
     Write-Step "Payload contract verified: $($payloadFiles.Count) files"
 }
 
+# --- Thunderstore package ---------------------------------------------------------------------
+# Thunderstore requires manifest.json, icon.png and README.md at the archive root, and mod managers
+# extract the package into BepInEx/plugins/<team>-<name>. The shipped archive is therefore flat:
+# the 13-file payload and the four store files sit at the root of BigScale.zip. dist/BepInEx stays
+# the staged tree scripts/install.ps1 consumes.
+$package = Join-Path $distRoot 'package'
+New-Item -ItemType Directory -Path $package -Force | Out-Null
+Copy-Item -Path (Join-Path $plugin '*') -Destination $package -Force
+Copy-Item -LiteralPath (Join-Path $repo 'thunderstore/manifest.json') -Destination (Join-Path $package 'manifest.json')
+Copy-Item -LiteralPath (Join-Path $repo 'assets/icon.png') -Destination (Join-Path $package 'icon.png')
+Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination (Join-Path $package 'README.md')
+Copy-Item -LiteralPath (Join-Path $repo 'CHANGELOG.md') -Destination (Join-Path $package 'CHANGELOG.md')
+
+$packageManifest = Get-Content -LiteralPath (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
+[xml]$managedProject = Get-Content -LiteralPath (Join-Path $repo 'src/managed/BigScale.csproj')
+$modVersion = @($managedProject.Project.PropertyGroup.Version | Where-Object { $_ }) | Select-Object -First 1
+if ($packageManifest.name -ne 'BigScale') {
+    throw "manifest.json name must be BigScale; found '$($packageManifest.name)'."
+}
+if ($packageManifest.version_number -ne $modVersion) {
+    throw "manifest.json version $($packageManifest.version_number) does not match BigScale.csproj version $modVersion."
+}
+$iconPath = Join-Path $package 'icon.png'
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Image]::FromFile($iconPath)
+try {
+    if ($icon.Width -ne 256 -or $icon.Height -ne 256) {
+        throw "Thunderstore icon.png must be 256x256; found $($icon.Width)x$($icon.Height)."
+    }
+}
+finally { $icon.Dispose() }
+if ($nativeOutput -and $managedOutput) {
+    $packageNames = @(Get-ChildItem -LiteralPath $package -File | ForEach-Object { $_.Name })
+    $expectedPackage = @($binaries) + $textNames + @('manifest.json', 'icon.png', 'README.md', 'CHANGELOG.md')
+    $missingPackage = @($expectedPackage | Where-Object { $packageNames -notcontains $_ })
+    $strayPackage = @($packageNames | Where-Object { $expectedPackage -notcontains $_ })
+    if ($missingPackage.Count -gt 0 -or $strayPackage.Count -gt 0 -or $packageNames.Count -ne $expectedPackage.Count) {
+        throw ("Thunderstore package contract failed. Missing: $($missingPackage -join ', '); " +
+               "unexpected: $($strayPackage -join ', '); found $($packageNames.Count) files, expected $($expectedPackage.Count).")
+    }
+    Write-Step "Thunderstore package verified: $($packageNames.Count) root files"
+}
+
 # --- diagnostics symbols ----------------------------------------------------------------------
 # Native symbols go into their own local archive. The managed assembly is built without a PDB so
 # the shipping DLL carries no absolute build path. Neither symbol file is staged into the plugin
@@ -270,7 +316,7 @@ if ($symbols.Count -gt 0) {
 # --- package ---------------------------------------------------------------------------------
 $zip = Join-Path $distRoot 'BigScale.zip'
 Write-Step 'Packing dist/BigScale.zip'
-Compress-Archive -Path (Join-Path $distRoot 'BepInEx') -DestinationPath $zip -Force
+Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -Force
 
 Write-Step 'Staged payload'
 Get-ChildItem -LiteralPath $plugin -Recurse -File |
@@ -278,7 +324,7 @@ Get-ChildItem -LiteralPath $plugin -Recurse -File |
     ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
 
 $manifest = @()
-foreach ($file in (Get-ChildItem -LiteralPath $plugin -Recurse -File | Sort-Object Name)) {
+foreach ($file in (Get-ChildItem -LiteralPath $package -File | Sort-Object Name)) {
     $manifest += '{0}  {1}' -f (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $file.Name
 }
 $manifest += '{0}  {1}' -f (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant(), 'BigScale.zip'

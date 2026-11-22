@@ -1,0 +1,9 @@
+{
+  "name": "BigScale",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/raharu-dev/BigScale",
+  "description": "Temporal Upscaling and Frame Generation for Big Walk using: DLSS, FSR 2/3/4, XeSS and ANR. Mod is experimental and has some issues.",
+  "dependencies": [
+    "BepInEx-BepInExPack_IL2CPP-6.0.788"
+  ]
+}

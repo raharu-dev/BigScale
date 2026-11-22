@@ -1,39 +1,42 @@
 # BigScale
 
-<img src="assets/logo.jpg" alt="BigScale" width="320">
+<img src="https://raw.githubusercontent.com/raharu-dev/BigScale/main/assets/logo.png" alt="BigScale" width="320">
 
-Temporal upscaling and optional frame generation for **Big Walk** (Unity 6, IL2CPP, Direct3D 11).
-Replaces URP's temporal upscale with NVIDIA DLSS, AMD FSR 2/3/4 or Intel XeSS, controlled from an
-in-game `Upscaling` settings category.
+Temporal Upscaling and Frame Generation for **Big Walk** (Unity 6, IL2CPP, Direct3D 11) using DLSS,
+FSR 2/3/4, XeSS and ANR. Replaces URP's temporal upscale, controlled from an in-game `Upscaling`
+settings category. Mod is experimental and has some issues.
 
 ## Status
 
 | Area | State |
 |---|---|
 | Desktop super resolution | Supported |
-| Frame generation | Works, but experimental and currently has issues |
+| Frame Generation | Works, but experimental and currently has issues |
 | DLSS5 Neural Rendering | Experimental and opt-in; requires a user-supplied runtime |
 | Big Walk VR mod | Not supported; BigScale does not work with it, and it might never work |
 
 > **Overlays:** Steam Overlay (Shift+Tab) and similar overlays may have issues with BigScale,
-> especially when frame generation is enabled.
+> especially when Frame Generation is enabled.
 
 ## Installation
 
 1. Install **BepInEx 6 (IL2CPP)** for Big Walk, then launch the game once and close it.
 2. Delete `BepInEx/plugins/BigWalkDLSS` if it exists. BigScale is a clean break and does not migrate
    old settings.
-3. Unzip `BigScale.zip` from the Releases page into the game root so the files land in
-   `BepInEx/plugins/BigScale/`.
+3. Install BigScale from the [Big Walk Thunderstore community](https://thunderstore.io/c/big-walk/)
+   with r2modman or Gale, or unzip `BigScale.zip` into `BepInEx/plugins/BigScale/`.
 4. Launch the game, open **Settings**, and select **Upscaling**.
+
+A mod-manager install lands in `BepInEx/plugins/<Team>-BigScale/`; the paths below use the manual
+`BigScale` folder name.
 
 ## Usage
 
-<img src="assets/settings.jpg" alt="BigScale Upscaling settings" width="720">
+<img src="https://raw.githubusercontent.com/raharu-dev/BigScale/main/assets/settings.jpg" alt="BigScale Upscaling settings" width="720">
 
 The `Upscaling` category has these rows:
 
-- **Enabled:** master switch for upscaling and frame generation.
+- **Enabled:** master switch for upscaling and Frame Generation.
 - **Upscaler:** NVIDIA DLSS, NVIDIA DLSS Preset L, AMD FSR 2, AMD FSR 3, AMD FSR 4, or Intel XeSS.
 - **Mode:** Quality, Balanced, Performance, Ultra Performance, or Native AA.
 - **Frame Generation (Experimental):** Off, NVIDIA, AMD FSR, Intel XeSS, or ANR.
@@ -44,7 +47,7 @@ Hold **TAB** in game for the status line. Settings are written to
 
 ## Recommended settings
 
-<img src="assets/comparison.jpg" alt="Upscaler comparison" width="720">
+<img src="https://raw.githubusercontent.com/raharu-dev/BigScale/main/assets/comparison.jpg" alt="Upscaler comparison" width="720">
 
 This comparison does not fully represent the in-game difference.
 
@@ -53,9 +56,9 @@ This comparison does not fully represent the in-game difference.
 | Best upscaling on NVIDIA RTX | **DLSS** |
 | Best upscaling on supported AMD GPUs | **FSR 4** — not tested, but expected to be the best |
 | Best upscaling on other GPUs | **XeSS** |
-| Best frame generation for most users | **ANR** (manual install) |
+| Best Frame Generation for most users | **ANR** (manual install) |
 
-## ANR frame generation (optional)
+## ANR Frame Generation
 
 ANR is not bundled with BigScale.
 
@@ -75,7 +78,7 @@ game restart.
 BigScale can add an experimental NGX neural-rendering pass. It needs a runtime that BigScale cannot
 redistribute:
 
-<img src="assets/nr.jpg" alt="Neural Rendering settings" width="720">
+<img src="https://raw.githubusercontent.com/raharu-dev/BigScale/main/assets/nr.jpg" alt="Neural Rendering settings" width="720">
 
 1. Place the RTX 40-series fp16 `nvngx_dlssnr.dll` at
    `BepInEx/plugins/BigScale/providers/dlss5/nvngx_dlssnr.dll` (or beside `BigScale.Native.dll`).
@@ -86,7 +89,7 @@ redistribute:
    and passes. **Character Masking currently does not work.**
 
 If the runtime is missing or unusable, the status row reports `Runtime missing` and normal
-upscaling and frame generation keep working.
+upscaling and Frame Generation keep working.
 
 ## Optional runtimes
 
@@ -102,4 +105,4 @@ The BepInEx log is `BepInEx/LogOutput.log`. For native provider problems, set
 
 ## License
 
-Apache License 2.0; see [`LICENSE`](LICENSE). Third-party notices are in `THIRD-PARTY-NOTICES.txt`.
+Apache License 2.0; see [`LICENSE`](https://github.com/raharu-dev/BigScale/blob/main/LICENSE). Third-party notices are in `THIRD-PARTY-NOTICES.txt`.

@@ -1,10 +1,6 @@
 BigScale
 ========
 
-Install
-  Close Big Walk, then copy the BepInEx folder from this archive into the game root,
-  merging folders. Big Walk must already have BepInEx 6 (IL2CPP) installed; launch it once first.
-
 Use
   Start the game, open Settings, and select the Upscaling category.
   NVIDIA RTX hardware is required for the DLSS backends.
