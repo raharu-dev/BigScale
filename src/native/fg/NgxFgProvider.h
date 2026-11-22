@@ -39,6 +39,7 @@ public:
     // this process; the transport keeps the ownership graph until the process exits.
     bool ProcessResident() const override { return flavor_ == Flavor::Anr; }
     bool Initialize(const FgInit& init, std::string& reason) override;
+    bool Preflight(const FgInit& init, std::string& reason) override;
     bool Record(FgPresent& present, std::string& reason) override;
     bool Present(FgPresent& present, std::string& reason) override;
     void Drain(std::string& reason) override;
@@ -50,8 +51,9 @@ public:
     uint32_t MaximumMultiplier() const override { return maximumMultiplier_; }
 
 private:
-    // Total multiplier equals one real frame plus at most this many generated intermediates. ANR
-    // reports up to five; NVIDIA is bounded to three by this implementation's own fixed capacity.
+    // Total multiplier equals one real frame plus at most this many generated intermediates. NVIDIA
+    // is bounded to three by this implementation's own fixed capacity; ANR is capped at one
+    // generated frame (2x total) even if its provider reports more.
     static constexpr uint32_t kMaxGeneratedFrames = 5;
 
     // One generated intermediate: the SDK's interpolated output, its interpolation-disable output
@@ -163,6 +165,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Fence> createFence_;
     Microsoft::WRL::ComPtr<ID3D12Fence> submitFence_;
     ListRing sdkList_;
+    // Ring for the per-intermediate child-buffer copy lists (CopyGenerated). The interpolation-
+    // disable readback no longer has a ring of its own: it rides the SDK list inside Record.
     ListRing copyList_;
     ListRing realList_;
     ID3D12Fence* sourceFence_ = nullptr;

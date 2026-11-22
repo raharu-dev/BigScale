@@ -25,11 +25,16 @@
     <Compile Include="../../src/managed/Core/SettingsPanelSchema.cs" />
     <Compile Include="../../src/managed/Core/XrJitter.cs" />
     <Compile Include="../../src/managed/Core/FrameGenerationActivity.cs" />
+    <Compile Include="../../src/managed/Core/FrameGenerationFamily.cs" />
     <Compile Include="../../src/managed/Core/VrMode.cs" />
     <Compile Include="../../src/managed/Core/HudTelemetry.cs" />
-    <Compile Include="../../src/managed/Core/MenuSession.cs" />
+    <Compile Include="../../src/managed/Core/HudPlacement.cs" />
     <Compile Include="../../src/managed/Core/CategoryColumnLayout.cs" />
     <Compile Include="../../src/managed/Core/PlayerMotionPolicy.cs" />
+    <Compile Include="../../src/managed/Core/NeuralRenderingModes.cs" />
+    <Compile Include="../../src/managed/Core/NeuralRenderingSchema.cs" />
+    <Compile Include="../../src/managed/Core/NeuralRenderingStatusText.cs" />
+    <Compile Include="../../src/managed/Core/CharacterMaskPolicy.cs" />
     <Compile Include="../../src/managed/Native.cs" />
     <Compile Include="../../src/managed/NativeFg.cs" />
     <Compile Include="../../src/managed/NativeVrFg.cs" />

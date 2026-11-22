@@ -1,0 +1,91 @@
+DLSS5 Neural Rendering (experimental)
+=====================================
+
+What it is
+----------
+An opt-in NGX feature-18 stage that runs on the game's converted per-eye colour, depth and motion
+textures through BigScale's D3D12 interop bridge. It can run before the selected upscaler (the neural
+image becomes the upscaler's colour input) or after it (the neural image is written into the
+upscaler's output). Either way it runs before frame generation.
+
+It is not a replacement for the upscaler. A missing runtime, unsupported GPU, failed feature
+creation, unsupported layout or an extent below 256x256 leaves the selected upscaler and frame
+generation producing exactly the image they produced without this feature; the reason is reported in
+the Neural Rendering status row and in BepInEx/BigScale/native.log.
+
+Enabling
+--------
+1. Close Big Walk.
+2. Edit BepInEx/config/raharu.bigscale.cfg:
+
+   [DLSS5]
+   Enabled = true
+   MasterEnabled = true
+   Preset = Default
+   Timing = BeforeUpscaling
+   Strength = 1.0
+   Detail = 1.0
+   Tone = 1.0
+   Passes = 1
+   CharacterMask = true
+   CharacterMaskShaders =
+
+3. Start the game and open Settings. `Neural Rendering` and `Neural Tuning` appear after `Upscaling`.
+
+`Enabled` only decides whether the categories exist. `MasterEnabled` is the in-game switch and is
+remembered independently; turning the gate off never rewrites it. Neural Rendering is effectively on
+when `Enabled`, `MasterEnabled` and an upscaler other than `Off` are selected.
+
+Runtime installation
+--------------------
+The NVIDIA neural-rendering model `nvngx_dlssnr.dll` is user-supplied and is never redistributed by
+BigScale. Place it at one of:
+
+  BepInEx/plugins/BigScale/providers/dlss5/nvngx_dlssnr.dll
+  BepInEx/plugins/BigScale/nvngx_dlssnr.dll
+
+The provider path wins when both exist. The 40-series fp16 compatibility build is the intended
+runtime; check its hash with the source that supplied it. See _ADDITIONAL_PROVIDERS.txt in the
+release package for the exact paths.
+
+The compatibility runtime rejects a caller whose module path does not contain `nvngx.dll`. BigScale
+does not patch any import table: it copies its own bridge as
+`BepInEx/BigScale/dlss5/nvngx.dll` and links the real runtime beside it as
+`dlss5/nvngx_dlssnr.dll`. The copy is required: a hard link to the already-loaded
+`BigScale.Native.dll` resolves to that module, whose path lacks `nvngx.dll`, and the runtime rejects
+it. The bridge exports the five NGX D3D12 entry points and forwards them to the real module. Both the
+copy and the runtime link are removed when the neural stage releases its device.
+
+Panels and rows
+---------------
+Neural Rendering: Enabled, Preset, Timing, Passes, Status.
+Neural Tuning: Strength, Detail, Tone, Character Masking.
+
+Each category lists its rows in a single column, so both pages fit without scrolling.
+
+- Preset: Default / Natural / Cinematic.
+- Timing: Before Upscaling / After Upscaling. Both are before frame generation.
+- Strength, Detail, Tone: 0.0..2.0 continuous sliders; 1.0 is the reference. Dragging previews the
+  value; the configuration is written when the pointer is released.
+- Passes: 1..5 sequential layers. Each layer owns a model and its temporal history; later layers
+  inherit the first except local tone.
+- Character Masking: keeps the original image wherever a player's body, including your own
+  first-person body, is actually drawn, so neural rendering does not repaint characters. Each
+  character submesh is drawn with the game's own material forward pass into a private depth
+  buffer, and only pixels that received depth enter the R8 mask, so geometry the game hides in its
+  shaders leaves no unedited patch. Renderers outside the camera's culling mask, inactive objects,
+  shadow-only proxies, transparent blob shadows, decals, disabled renderers, non-mesh effects and
+  your own nose are excluded; visibility is re-checked every frame. `CharacterMaskShaders` adds
+  comma-separated, case-insensitive shader-name substrings for character variants.
+- Status: Off / Select an Upscaler / Waiting / Active / Runtime missing / Failed /
+  Unsupported (desktop only).
+
+Limits
+------
+- Desktop 2D packets only (one slice, one view). VR, single-pass stereo and packed layouts report
+  Unsupported and leave the upscaler untouched.
+- The stage refuses a colour extent below 256x256; the compatibility model's smallest verified tile
+  is larger than that.
+- The categories are built when the game's settings page is created. Editing `[DLSS5] Enabled` while
+  the game is running may require reopening the main menu. Changing `MasterEnabled` in the panel is
+  immediate, and the three sliders write their value when the pointer is released.

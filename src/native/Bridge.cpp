@@ -2,6 +2,7 @@
 #include "ContextState.h"
 #include "EyeResources.h"
 #include "Log.h"
+#include "NeuralRendering.h"
 #include "NgxBackend.h"
 #include "StageProbe.h"
 #include "vr/XrPresentationProof.h"
@@ -34,7 +35,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-static_assert(sizeof(BIGSCALE_Frame) == 176, "BIGSCALE_Frame must stay 176 bytes for the managed mirror");
+static_assert(sizeof(BIGSCALE_Frame) == 192, "BIGSCALE_Frame must stay 192 bytes for the managed mirror");
 static_assert(offsetof(BIGSCALE_Frame, color) == 80, "BIGSCALE_Frame::color offset");
 static_assert(offsetof(BIGSCALE_Frame, output) == 104, "BIGSCALE_Frame::output offset");
 static_assert(offsetof(BIGSCALE_Frame, jitterX) == 112, "BIGSCALE_Frame::jitterX offset");
@@ -44,6 +45,9 @@ static_assert(offsetof(BIGSCALE_Frame, upscaler) == 148, "BIGSCALE_Frame::upscal
 static_assert(offsetof(BIGSCALE_Frame, cameraNear) == 152, "BIGSCALE_Frame::cameraNear offset");
 static_assert(offsetof(BIGSCALE_Frame, preExposure) == 164, "BIGSCALE_Frame::preExposure offset");
 static_assert(offsetof(BIGSCALE_Frame, fgCaptureTag) == 168, "BIGSCALE_Frame::fgCaptureTag offset");
+static_assert(offsetof(BIGSCALE_Frame, neuralMask) == 176, "BIGSCALE_Frame::neuralMask offset");
+static_assert(offsetof(BIGSCALE_Frame, neuralMaskWidth) == 184, "BIGSCALE_Frame::neuralMaskWidth offset");
+static_assert(offsetof(BIGSCALE_Frame, neuralMaskHeight) == 188, "BIGSCALE_Frame::neuralMaskHeight offset");
 static_assert(sizeof(BIGSCALE_ModeInfo) == 32, "BIGSCALE_ModeInfo must stay 32 bytes");
 static_assert(sizeof(BIGSCALE_ViewInfo) == 24, "BIGSCALE_ViewInfo must stay 24 bytes");
 static_assert(sizeof(BIGSCALE_Completion) == 76, "BIGSCALE_Completion must stay 76 bytes");
@@ -54,12 +58,20 @@ static_assert(offsetof(BIGSCALE_Completion, upscaler) == 52, "BIGSCALE_Completio
 static_assert(offsetof(BIGSCALE_Completion, sliceCount) == 68, "BIGSCALE_Completion::sliceCount offset");
 static_assert(sizeof(BIGSCALE_Status) == 1176, "BIGSCALE_Status must stay 1176 bytes");
 static_assert(offsetof(BIGSCALE_Status, views) == 224, "BIGSCALE_Status::views offset");
+static_assert(offsetof(BIGSCALE_Status, faultCount) == 280, "BIGSCALE_Status::faultCount offset");
+static_assert(offsetof(BIGSCALE_Status, neuralState) == 284, "BIGSCALE_Status::neuralState offset");
 static_assert(offsetof(BIGSCALE_Status, completionPublished) == 288, "BIGSCALE_Status::completionPublished offset");
 static_assert(offsetof(BIGSCALE_Status, completions) == 296, "BIGSCALE_Status::completions offset");
 static_assert(offsetof(BIGSCALE_Status, queryUpscaler) == 904, "BIGSCALE_Status::queryUpscaler offset");
 static_assert(offsetof(BIGSCALE_Status, activeUpscaler) == 908, "BIGSCALE_Status::activeUpscaler offset");
 static_assert(offsetof(BIGSCALE_Status, providerVersionId) == 912, "BIGSCALE_Status::providerVersionId offset");
 static_assert(offsetof(BIGSCALE_Status, backendReason) == 920, "BIGSCALE_Status::backendReason offset");
+static_assert(sizeof(BIGSCALE_NeuralConfig) == 44, "BIGSCALE_NeuralConfig must stay 44 bytes");
+static_assert(offsetof(BIGSCALE_NeuralConfig, abi) == 0, "BIGSCALE_NeuralConfig::abi offset");
+static_assert(offsetof(BIGSCALE_NeuralConfig, enabled) == 8, "BIGSCALE_NeuralConfig::enabled offset");
+static_assert(offsetof(BIGSCALE_NeuralConfig, passes) == 20, "BIGSCALE_NeuralConfig::passes offset");
+static_assert(offsetof(BIGSCALE_NeuralConfig, strength) == 24, "BIGSCALE_NeuralConfig::strength offset");
+static_assert(offsetof(BIGSCALE_NeuralConfig, characterMask) == 36, "BIGSCALE_NeuralConfig::characterMask offset");
 namespace
 {
 using namespace bigscale;
@@ -136,6 +148,24 @@ std::atomic<uint64_t> g_evaluations{0};
 std::atomic<bool> g_shutdownRequested{false};
 std::atomic<bool> g_faultLatched{false};
 
+// Neural Rendering configuration, copied verbatim from managed under g_neuralConfigMutex. The
+// generation changes only when a field changes, so a later stage can rebuild its feature set without
+// diffing values itself. Nothing here touches the GPU or the NGX SDK: configure must never block the
+// managed main thread behind render work.
+BIGSCALE_NeuralConfig g_neuralConfig{};
+uint64_t g_neuralGeneration = 0;
+std::mutex g_neuralConfigMutex;
+std::atomic<int32_t> g_neuralState{BIGSCALE_NEURAL_OFF};
+
+// Field-by-field rather than memcmp so uninitialized padding can never fabricate a change.
+bool SameNeuralConfig(const BIGSCALE_NeuralConfig& left, const BIGSCALE_NeuralConfig& right)
+{
+    return left.abi == right.abi && left.size == right.size && left.enabled == right.enabled &&
+        left.style == right.style && left.timing == right.timing && left.passes == right.passes &&
+        left.strength == right.strength && left.detail == right.detail && left.tone == right.tone &&
+        left.characterMask == right.characterMask && left.reserved == right.reserved;
+}
+
 #if defined(BIGSCALE_TESTING)
 // Native-check-only seam: a queued evaluation forces this result while the real bridge baseline,
 // fault, completion and retirement logic still runs. Absent from the packaged bridge entirely.
@@ -150,6 +180,10 @@ bool g_initialized = false;
 std::unique_ptr<IUpscalerBackend> g_backend;
 int32_t g_backendKind = -1;
 EyeResources g_eyes;
+// DLSS5 Neural Rendering. Render-thread owned: SetEnvironment from initialise, Configure from the
+// managed main thread (config copy only), Before/AfterUpscale from HandleProbeOrEvaluate, Release
+// from ReleaseDeviceState after a proven GPU idle. Nothing here may fault the selected upscaler.
+bigscale::NeuralRenderingStage g_neural;
 
 // Device bookkeeping shared with the render event. Only touched on the render thread.
 ComPtr<ID3D11Device> g_device;
@@ -649,6 +683,9 @@ void ReleaseDeviceState(const char* reason)
     ClearReason();
     StageProbe::Reset();
     XrPresentationProof::Release();
+    // Every caller of this function proved the GPU idle, so the stage may free its features,
+    // textures, parameter maps and the NGX runtime it owns.
+    g_neural.Release();
     g_device.Reset();
     g_context.Reset();
     g_deviceBound = false;
@@ -958,6 +995,24 @@ void HandleProbeOrEvaluate(BIGSCALE_Frame& frame, RingSlot& slot)
         return;
     }
 
+    // Neural Rendering inputs. The mask is a Unity-owned render-graph texture that the graph keeps
+    // alive for the whole pass: this pointer is copied without AddRef and must never be released here
+    // or by the packet release loop. A partially described mask counts as no mask.
+    void* neuralMask = frame.neuralMask;
+    uint32_t neuralMaskWidth = frame.neuralMaskWidth > 0 ? static_cast<uint32_t>(frame.neuralMaskWidth) : 0;
+    uint32_t neuralMaskHeight = frame.neuralMaskHeight > 0 ? static_cast<uint32_t>(frame.neuralMaskHeight) : 0;
+    if (neuralMask == nullptr || neuralMaskWidth == 0 || neuralMaskHeight == 0)
+    {
+        neuralMask = nullptr;
+        neuralMaskWidth = 0;
+        neuralMaskHeight = 0;
+    }
+    // Neural rendering is only defined for one desktop view per texture. A VR, single-pass stereo or
+    // packed packet reports Unsupported on the stage (a state note only, no GPU or SDK work) and never
+    // reaches Before/AfterUpscale below.
+    const bool neuralLayout = frame.layout == BIGSCALE_LAYOUT_2D && frame.sliceCount == 1;
+    if (!neuralLayout) g_neural.MarkUnsupported();
+
     int32_t packetResult = 0;
     if (request.bilinearComparison)
     {
@@ -986,6 +1041,16 @@ void HandleProbeOrEvaluate(BIGSCALE_Frame& frame, RingSlot& slot)
         else
         {
             bool created = false;
+            // Pre-upscaling neural rendering replaces the backend's colour input with the neural
+            // image. A null return means the stage did not run this frame (AfterUpscaling timing,
+            // disabled, not ready yet or a failure it already reported), so the converted scratch
+            // stays the backend input and super resolution is unaffected.
+            if (neuralLayout)
+            {
+                if (ID3D11Resource* neuralColor = g_neural.BeforeUpscale(g_device.Get(), g_context.Get(), key,
+                        request, neuralMask, neuralMaskWidth, neuralMaskHeight))
+                    request.color = neuralColor;
+            }
 #if defined(BIGSCALE_TESTING)
             const bool forced = g_forcedEvaluationResult.has_value();
             const int32_t result = forced ? *g_forcedEvaluationResult : g_backend->Evaluate(key, request, created);
@@ -997,6 +1062,15 @@ void HandleProbeOrEvaluate(BIGSCALE_Frame& frame, RingSlot& slot)
 #else
             const int32_t result = g_backend->Evaluate(key, request, created);
 #endif
+            // Post-upscaling neural rendering composites into request.output, which the backend just
+            // produced, before CopyBack moves it into the engine texture. A false return means the
+            // stage left request.output untouched, so the super-resolution image is written. The
+            // result is deliberately ignored for control flow: a neural failure must never latch the
+            // bridge fault, set g_lastError or change packetResult, and the stage owns its own state
+            // and logging.
+            if (result == 0 && neuralLayout)
+                g_neural.AfterUpscale(g_device.Get(), g_context.Get(), key, request, neuralMask, neuralMaskWidth,
+                    neuralMaskHeight);
             // The backend contract is zero success and any nonzero value a failure; a positive
             // FidelityFX error is just as authoritative as a negative NGX code.
             if (result != 0)
@@ -1236,6 +1310,8 @@ void __stdcall RenderEvent(int32_t eventId, void* data)
         Log("unhandled native exception; integration faulted.");
         LatchFault(BIGSCALE_ERROR_RENDER_EVENT_FAILED);
     }
+    // Only the four engine textures were AddRef'd by QueueFrame, so only those are released here.
+    // The neural mask is a managed render-graph texture for this pass: never AddRef'd, never released.
     for (void** resource : {reinterpret_cast<void**>(&slot->frame.color), reinterpret_cast<void**>(&slot->frame.depth),
              reinterpret_cast<void**>(&slot->frame.motion), reinterpret_cast<void**>(&slot->frame.output)})
     {
@@ -1311,6 +1387,9 @@ BIGSCALE_EXPORT uint32_t BIGSCALE_GetFrameLayout(uint32_t* offsets, uint32_t cou
         static_cast<uint32_t>(offsetof(BIGSCALE_Frame, verticalFovRadians)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Frame, preExposure)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Frame, fgCaptureTag)),
+        static_cast<uint32_t>(offsetof(BIGSCALE_Frame, neuralMask)),
+        static_cast<uint32_t>(offsetof(BIGSCALE_Frame, neuralMaskWidth)),
+        static_cast<uint32_t>(offsetof(BIGSCALE_Frame, neuralMaskHeight)),
     };
     return CopyLayout(values, offsets, count);
 }
@@ -1369,7 +1448,7 @@ BIGSCALE_EXPORT uint32_t BIGSCALE_GetStatusLayout(uint32_t* offsets, uint32_t co
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, viewCount)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, bilinearComparisons)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, faultCount)),
-        static_cast<uint32_t>(offsetof(BIGSCALE_Status, reserved)),
+        static_cast<uint32_t>(offsetof(BIGSCALE_Status, neuralState)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, completionPublished)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, completionBase)),
         static_cast<uint32_t>(offsetof(BIGSCALE_Status, completions[0])),
@@ -1407,6 +1486,7 @@ BIGSCALE_EXPORT int32_t BIGSCALE_Initialize(const wchar_t* runtimeDirectory, con
     Log("BigScale native bridge initialised abi=%u frameSize=%zu statusSize=%zu ring=%d retainedCompletions=%d",
         BIGSCALE_ABI_VERSION, sizeof(BIGSCALE_Frame), sizeof(BIGSCALE_Status), BIGSCALE_RING_CAPACITY,
         BIGSCALE_COMPLETION_QUEUE);
+    g_neural.SetEnvironment(g_runtimeDirectory, g_dataDirectory, g_engineVersion);
     return 1;
 }
 
@@ -1416,7 +1496,12 @@ BIGSCALE_EXPORT void BIGSCALE_SetEngineVersion(const char* engineVersion)
     g_engineVersion = engineVersion;
     if (g_backend) g_backend->SetEngineVersion(g_engineVersion);
     bigscale::FrameGeneration::SetEngineVersion(g_engineVersion);
+    g_neural.SetEnvironment(g_runtimeDirectory, g_dataDirectory, g_engineVersion);
 }
+
+// Calling this with 0 before BIGSCALE_Initialize prevents native.log from being created at all: the
+// flag is remembered and SetLogDirectory only opens the file when logging is enabled.
+BIGSCALE_EXPORT void BIGSCALE_SetNativeLog(int32_t enabled) { bigscale::SetLogEnabled(enabled != 0); }
 
 BIGSCALE_EXPORT void* BIGSCALE_GetRenderEvent() { return reinterpret_cast<void*>(&RenderEvent); }
 
@@ -1458,6 +1543,9 @@ BIGSCALE_EXPORT void* BIGSCALE_QueueFrame(const BIGSCALE_Frame* frame)
         slot.frameIndex = frame->frameIndex;
         slot.historyEpoch = frame->historyEpoch;
         slot.operation = frame->operation;
+        // slot.frame = *frame above also copies neuralMask, deliberately without an AddRef: the mask
+        // is a Unity render-graph texture that the graph owns for the whole pass, not a resource whose
+        // lifetime this ring extends. Never add it to this AddRef pair or to RenderEvent's release.
         for (void** resource : {reinterpret_cast<void**>(&slot.frame.color), reinterpret_cast<void**>(&slot.frame.depth),
                  reinterpret_cast<void**>(&slot.frame.motion), reinterpret_cast<void**>(&slot.frame.output)})
         {
@@ -1470,6 +1558,26 @@ BIGSCALE_EXPORT void* BIGSCALE_QueueFrame(const BIGSCALE_Frame* frame)
     Publish(BIGSCALE_STATE_FAULTED);
     Log("render packet ring is full (%d slots busy); treating as a renderer fault.", BIGSCALE_RING_CAPACITY);
     return nullptr;
+}
+
+BIGSCALE_EXPORT int32_t BIGSCALE_ConfigureNeuralRendering(const BIGSCALE_NeuralConfig* config)
+{
+    if (config == nullptr || config->abi != BIGSCALE_NEURAL_ABI_VERSION ||
+        config->size != sizeof(BIGSCALE_NeuralConfig))
+    {
+        return BIGSCALE_ERROR_ABI_MISMATCH;
+    }
+    std::lock_guard<std::mutex> guard(g_neuralConfigMutex);
+    if (!SameNeuralConfig(g_neuralConfig, *config)) g_neuralGeneration++;
+    g_neuralConfig = *config;
+    // The stage copies the block under its own mutex and reports the state it reached from that copy.
+    // A disabled feature must not run at all; an accepted enabled configuration waits for the first
+    // successfully evaluated frame. Values are stored unclamped and the stage reports RuntimeMissing,
+    // Failed and Unsupported from its own observation of the runtime and the packet. No GPU work runs
+    // here, so the managed main thread is never blocked behind render or SDK work.
+    g_neural.Configure(g_neuralConfig);
+    g_neuralState.store(g_neural.State());
+    return 0;
 }
 
 BIGSCALE_EXPORT int32_t BIGSCALE_GetStatus(BIGSCALE_Status* status)
@@ -1536,6 +1644,9 @@ BIGSCALE_EXPORT int32_t BIGSCALE_GetStatus(BIGSCALE_Status* status)
     status->viewCount = g_viewUsed;
     status->bilinearComparisons = g_bilinearCount;
     status->faultCount = g_faultCount;
+    // The stage owns the state machine: this snapshot must report what the stage actually reached,
+    // including RuntimeMissing, Failed and Unsupported, not the state a configure call published.
+    status->neuralState = g_neural.State();
     // Oldest retained records first; managed acknowledges the newest it consumed.
     status->completionPublished = g_completionCount;
     status->completionBase = g_completionCount > 0 ? g_completions[0].sequence : 0;

@@ -1,0 +1,7 @@
+EXPORTS
+    NVSDK_NGX_D3D12_Init_Ext=BigScaleNvngxInitExt
+    NVSDK_NGX_D3D12_CreateFeature=BigScaleNvngxCreateFeature
+    NVSDK_NGX_D3D12_EvaluateFeature=BigScaleNvngxEvaluateFeature
+    NVSDK_NGX_D3D12_ReleaseFeature=BigScaleNvngxReleaseFeature
+    NVSDK_NGX_D3D12_Shutdown1=BigScaleNvngxShutdown1
+    BigScaleNvngxReleaseReal

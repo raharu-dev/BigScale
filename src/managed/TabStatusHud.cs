@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using BepInEx.Logging;
+using BigScale.Core;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -23,7 +24,6 @@ internal sealed class TabStatusHud
 {
     private const string ObjectName = "BigScale.HudStatus";
     private const float RefreshSeconds = 0.25f;
-    private const float FallbackInset = 16f;
 
     private static readonly ManualLogSource Log = BepInEx.Logging.Logger.CreateLogSource("BigScale.HUD");
 
@@ -38,8 +38,8 @@ internal sealed class TabStatusHud
     private FPSDisplay? _fps;
     private TextMeshProUGUI? _text;
     private bool _missingLogged;
+    private bool _placed;
     private bool _placementReported;
-    private bool _viewFallbackReported;
     private bool _placementLogged;
     private float _nextRefresh;
     private string _writtenRows = "";
@@ -88,8 +88,8 @@ internal sealed class TabStatusHud
         _lastStock = "";
         _lastDecorated = "";
         _nextRefresh = 0f;
+        _placed = false;
         _placementReported = false;
-        _viewFallbackReported = false;
         _placementLogged = false;
         try
         {
@@ -139,7 +139,9 @@ internal sealed class TabStatusHud
         text.wordSpacing = stock.wordSpacing;
         text.lineSpacing = stock.lineSpacing;
         text.paragraphSpacing = stock.paragraphSpacing;
-        text.margin = stock.margin;
+        // The rows own their screen margin through HudPlacement. Copying the stock margin would apply
+        // that padding inside the row rect and double-count the measured screen margin.
+        text.margin = Vector4.zero;
         text.alignment = TextAlignmentOptions.BottomLeft;
         text.raycastTarget = false;
         text.enableWordWrapping = false;
@@ -155,77 +157,73 @@ internal sealed class TabStatusHud
         rect.pivot = Vector2.zero;
         rect.localScale = Vector3.one;
         rect.sizeDelta = Vector2.one;
-        rect.anchoredPosition3D = Vector3.zero;
+        rect.anchoredPosition3D =
+            new Vector3(HudPlacement.FallbackInset, HudPlacement.FallbackInset, 0f);
         text.transform.SetAsLastSibling();
         return text;
     }
 
     /// <summary>
-    /// Places the injected rows at the bottom-left of the UI view, reusing the stock counter's own
-    /// distance to its nearest edge as the margin. The view is the root canvas rectangle of the
-    /// overlay's canvas, so screen pixels, resolution changes, UI scaling and the VR canvas are all
-    /// handled by the same measurement. <c>detailsOverlay</c> is a plain <see cref="Transform"/>, so
-    /// its own rectangle exists only when it happens to be a RectTransform; the canvas supplies the
-    /// view in every other case. Returns false while no view is measurable.
+    /// Places the injected rows at the bottom-left of the resolved UI view, using the stock counter's
+    /// own smallest edge gap as the margin. Glyph bounds are measured first; the stock rect is the
+    /// fallback while the text mesh is not readable. A failure writes the fallback margin (or keeps
+    /// the last measured placement), so the rows never land at the view corner or carry a non-finite
+    /// transform. Returns false when nothing could be measured this refresh.
     /// </summary>
     private bool UpdatePlacement()
     {
         var text = _text;
         var overlay = _overlay;
         var stock = _fps != null ? _fps.textField : null;
-        var stockRect = stock != null ? stock.rectTransform : null;
-        if (text == null || overlay == null || stockRect == null) return false;
-        var canvasRect = _canvasRect;
-        if (canvasRect == null) canvasRect = _canvasRect = ResolveViewRect();
-        var inCanvas = canvasRect != null && IsUsableView(canvasRect.rect);
-        var overlayRect = overlay as RectTransform;
-        var view = inCanvas ? canvasRect!.rect : overlayRect != null ? overlayRect.rect : default;
-        if (!IsUsableView(view)) return false;
-        if (inCanvas) _viewFallbackReported = false;
-        else ReportViewFallback(overlay, view);
+        if (text == null || overlay == null || stock == null) return false;
 
-        // Measure in view units: the overlay is only a child of the canvas and may be scaled, and the
-        // stock counter may be nested deeper still.
-        stockRect.GetWorldCorners(_corners);
-        var minX = float.PositiveInfinity;
-        var maxX = float.NegativeInfinity;
-        var minY = float.PositiveInfinity;
-        var maxY = float.NegativeInfinity;
-        for (var i = 0; i < _corners.Length; i++)
+        var viewRect = _canvasRect;
+        if (viewRect == null || !IsUsableView(viewRect.rect))
+            viewRect = _canvasRect = ResolveViewRect();
+        if (viewRect == null || !IsUsableView(viewRect.rect))
         {
-            var corner = inCanvas
-                ? canvasRect!.InverseTransformPoint(_corners[i])
-                : overlay.InverseTransformPoint(_corners[i]);
-            if (corner.x < minX) minX = corner.x;
-            if (corner.x > maxX) maxX = corner.x;
-            if (corner.y < minY) minY = corner.y;
-            if (corner.y > maxY) maxY = corner.y;
+            ApplyFallbackPlacement("no measurable view");
+            return false;
         }
-        var inset = NearestInset(minX - view.xMin, view.xMax - maxX, minY - view.yMin, view.yMax - maxY);
-        if (!(inset > 0f)) inset = FallbackInset;
 
-        var lowX = view.xMin + inset;
-        var highX = view.xMax - inset;
-        if (!(highX > lowX)) highX = lowX + 1f;
-        var lowY = view.yMin + inset;
+        var view = viewRect.rect;
+        if (!TryMeasureStock(stock, viewRect, out var minX, out var maxX, out var minY, out var maxY,
+                out var glyphs))
+        {
+            ApplyFallbackPlacement("the stock counter has no measurable bounds");
+            return false;
+        }
+
+        if (!HudPlacement.TryResolveInset(minX - view.xMin, view.xMax - maxX,
+                minY - view.yMin, view.yMax - maxY, HudPlacement.FallbackInset,
+                Mathf.Min(view.width, view.height) * 0.5f, out var inset))
+        {
+            ApplyFallbackPlacement("no usable stock margin");
+            return false;
+        }
+
         var lineHeight = maxY - minY;
-        if (!(lineHeight > 0f)) lineHeight = Mathf.Max(1f, stock != null ? stock.fontSize : 1f);
-        var highY = lowY + lineHeight * 2f;
+        if (!(lineHeight > 0f)) lineHeight = Mathf.Max(1f, stock.fontSize);
+        if (!HudPlacement.TryGetRows(view.xMin, view.yMin, view.width, view.height, inset,
+                2, lineHeight, out var lowX, out var lowY, out var rowWidth, out var rowHeight))
+        {
+            ApplyFallbackPlacement("no usable row rectangle");
+            return false;
+        }
 
-        var bottomLeft = inCanvas
-            ? overlay.InverseTransformPoint(canvasRect!.TransformPoint(new Vector3(lowX, lowY, 0f)))
-            : new Vector3(lowX, lowY, 0f);
-        var bottomRight = inCanvas
-            ? overlay.InverseTransformPoint(canvasRect!.TransformPoint(new Vector3(highX, lowY, 0f)))
-            : new Vector3(highX, lowY, 0f);
-        var topLeft = inCanvas
-            ? overlay.InverseTransformPoint(canvasRect!.TransformPoint(new Vector3(lowX, highY, 0f)))
-            : new Vector3(lowX, highY, 0f);
-        var width = bottomRight.x - bottomLeft.x;
-        var height = topLeft.y - bottomLeft.y;
+        var overlayRect = overlay as RectTransform;
+        var bottomLeft = overlay.InverseTransformPoint(
+            viewRect.TransformPoint(new Vector3(lowX, lowY, 0f)));
+        var topRight = overlay.InverseTransformPoint(
+            viewRect.TransformPoint(new Vector3(lowX + rowWidth, lowY + rowHeight, 0f)));
+        var width = topRight.x - bottomLeft.x;
+        var height = topRight.y - bottomLeft.y;
         if (!float.IsFinite(width) || !float.IsFinite(height) ||
             !float.IsFinite(bottomLeft.x) || !float.IsFinite(bottomLeft.y))
+        {
+            ApplyFallbackPlacement("the view could not be mapped into the overlay");
             return false;
+        }
 
         // Zero anchors put the pivot at the parent's anchor reference point: a RectTransform parent
         // references its own rectangle's bottom-left corner, while a plain Transform parent references
@@ -233,14 +231,22 @@ internal sealed class TabStatusHud
         var anchored = overlayRect != null
             ? new Vector2(bottomLeft.x - overlayRect.rect.xMin, bottomLeft.y - overlayRect.rect.yMin)
             : new Vector2(bottomLeft.x, bottomLeft.y);
+        if (!float.IsFinite(anchored.x) || !float.IsFinite(anchored.y))
+        {
+            ApplyFallbackPlacement("the overlay rectangle is not finite");
+            return false;
+        }
         var rect = text.rectTransform;
         rect.anchorMin = Vector2.zero;
         rect.anchorMax = Vector2.zero;
         rect.pivot = Vector2.zero;
         rect.sizeDelta = new Vector2(Mathf.Max(1f, width), Mathf.Max(1f, height));
         rect.anchoredPosition3D = new Vector3(anchored.x, anchored.y, 0f);
-        ReportPlacement(overlay, canvasRect, view, inCanvas, inset, rect.sizeDelta, anchored,
-            maxX - minX, maxY - minY);
+
+        _placed = true;
+        _placementReported = false;
+        ReportPlacement(viewRect, overlay, glyphs, minX - view.xMin, view.xMax - maxX,
+            minY - view.yMin, view.yMax - maxY, inset, rect.sizeDelta, anchored);
         return true;
     }
 
@@ -250,7 +256,7 @@ internal sealed class TabStatusHud
     /// <summary>
     /// The rectangle of the UI view this overlay belongs to: the root canvas of the overlay's canvas.
     /// Inactive objects are included because binding happens before the overlay is first shown, and
-    /// the search falls back to the highest RectTransform ancestor, which is that same canvas
+    /// the search falls back to the highest usable RectTransform ancestor, which is that same canvas
     /// rectangle for any overlay parented under a canvas.
     /// </summary>
     private RectTransform? ResolveViewRect()
@@ -259,64 +265,139 @@ internal sealed class TabStatusHud
         if (overlay == null) return null;
         var canvas = overlay.GetComponentInParent<Canvas>(true);
         var root = canvas != null ? canvas.rootCanvas : null;
-        var rect = root != null ? root.transform as RectTransform : null;
-        if (rect != null) return rect;
-        var current = overlay;
-        while (current != null)
-        {
-            if (current is RectTransform candidate) rect = candidate;
-            current = current.parent;
-        }
-        return rect;
+        var rootRect = root != null ? root.transform as RectTransform : null;
+        if (rootRect != null && IsUsableView(rootRect.rect)) return rootRect;
+
+        RectTransform? usable = null;
+        for (var current = overlay; current != null; current = current.parent)
+            if (current is RectTransform candidate && IsUsableView(candidate.rect))
+                usable = candidate;
+        return usable ?? rootRect;
     }
 
-    /// <summary>Smallest nonnegative distance of the four given edge gaps, or positive infinity.</summary>
-    private static float NearestInset(float left, float right, float bottom, float top)
+    /// <summary>
+    /// Measures the stock counter's visible bounds in view units. Glyph bounds are preferred because
+    /// the stock rect may span the whole row while its text is inset; a zero or unreadable mesh falls
+    /// back to the rect. Returns false when neither yields a usable rectangle.
+    /// </summary>
+    private bool TryMeasureStock(TMP_Text stock, RectTransform view,
+        out float minX, out float maxX, out float minY, out float maxY, out bool glyphs)
     {
-        var nearest = float.PositiveInfinity;
-        if (left >= 0f && left < nearest) nearest = left;
-        if (right >= 0f && right < nearest) nearest = right;
-        if (bottom >= 0f && bottom < nearest) nearest = bottom;
-        if (top >= 0f && top < nearest) nearest = top;
-        return nearest;
+        minX = float.PositiveInfinity;
+        maxX = float.NegativeInfinity;
+        minY = float.PositiveInfinity;
+        maxY = float.NegativeInfinity;
+        glyphs = false;
+        if (stock == null || view == null) return false;
+        var stockRect = stock.rectTransform;
+        if (stockRect == null) return false;
+
+        try
+        {
+            var bounds = stock.textBounds;
+            if (IsUsableBounds(bounds) &&
+                TryMeasureCorners(bounds.min, bounds.max, stockRect, view,
+                    out minX, out maxX, out minY, out maxY))
+            {
+                glyphs = true;
+                return true;
+            }
+        }
+        catch
+        {
+            // The interop proxy or mesh is not readable yet; the rect below is the fallback.
+        }
+
+        try
+        {
+            stockRect.GetWorldCorners(_corners);
+            // A rejected glyph box leaves zeroes in the outputs above; this path owns its own range.
+            minX = float.PositiveInfinity;
+            maxX = float.NegativeInfinity;
+            minY = float.PositiveInfinity;
+            maxY = float.NegativeInfinity;
+            for (var i = 0; i < _corners.Length; i++)
+            {
+                var corner = view.InverseTransformPoint(_corners[i]);
+                if (!IsFinite(corner)) return false;
+                if (corner.x < minX) minX = corner.x;
+                if (corner.x > maxX) maxX = corner.x;
+                if (corner.y < minY) minY = corner.y;
+                if (corner.y > maxY) maxY = corner.y;
+            }
+            return maxX > minX && maxY > minY;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
-    /// <summary>Records the resolved view and geometry once per placement source.</summary>
-    private void ReportPlacement(Transform overlay, RectTransform? canvasRect, Rect view, bool inCanvas,
-        float inset, Vector2 size, Vector2 anchored, float stockWidth, float stockHeight)
+    /// <summary>
+    /// Projects the local min/max corner pair of a TMP rect into view space. <c>textBounds</c> is
+    /// local to the stock RectTransform (pivot-relative), so it must pass through that transform
+    /// before the view inverse.
+    /// </summary>
+    private static bool TryMeasureCorners(Vector3 localMin, Vector3 localMax, RectTransform source,
+        RectTransform view, out float minX, out float maxX, out float minY, out float maxY)
+    {
+        var a = view.InverseTransformPoint(source.TransformPoint(new Vector3(localMin.x, localMin.y, 0f)));
+        var b = view.InverseTransformPoint(source.TransformPoint(new Vector3(localMin.x, localMax.y, 0f)));
+        var c = view.InverseTransformPoint(source.TransformPoint(new Vector3(localMax.x, localMin.y, 0f)));
+        var d = view.InverseTransformPoint(source.TransformPoint(new Vector3(localMax.x, localMax.y, 0f)));
+        minX = 0f; maxX = 0f; minY = 0f; maxY = 0f;
+        if (!IsFinite(a) || !IsFinite(b) || !IsFinite(c) || !IsFinite(d)) return false;
+        minX = Mathf.Min(Mathf.Min(a.x, b.x), Mathf.Min(c.x, d.x));
+        maxX = Mathf.Max(Mathf.Max(a.x, b.x), Mathf.Max(c.x, d.x));
+        minY = Mathf.Min(Mathf.Min(a.y, b.y), Mathf.Min(c.y, d.y));
+        maxY = Mathf.Max(Mathf.Max(a.y, b.y), Mathf.Max(c.y, d.y));
+        return maxX > minX && maxY > minY;
+    }
+
+    private static bool IsUsableBounds(Bounds bounds) =>
+        float.IsFinite(bounds.center.x) && float.IsFinite(bounds.center.y) &&
+        float.IsFinite(bounds.size.x) && float.IsFinite(bounds.size.y) &&
+        bounds.size.x > 0f && bounds.size.y > 0f;
+
+    private static bool IsFinite(Vector3 value) =>
+        float.IsFinite(value.x) && float.IsFinite(value.y) && float.IsFinite(value.z);
+
+    /// <summary>
+    /// Writes the fallback margin when nothing could be measured. A placement measured on an earlier
+    /// refresh is kept instead, so a transient measurement failure never moves good rows back to the
+    /// view corner. Reports once per fallback episode.
+    /// </summary>
+    private void ApplyFallbackPlacement(string reason)
+    {
+        var text = _text;
+        if (text == null) return;
+        if (_placed) return; // a measured placement from an earlier row refresh is better than a guess
+
+        var rect = text.rectTransform;
+        rect.anchorMin = Vector2.zero;
+        rect.anchorMax = Vector2.zero;
+        rect.pivot = Vector2.zero;
+        rect.sizeDelta = Vector2.one;
+        rect.anchoredPosition3D =
+            new Vector3(HudPlacement.FallbackInset, HudPlacement.FallbackInset, 0f);
+
+        if (_placementReported) return;
+        _placementReported = true;
+        _report("the hold-TAB status rows could not be measured (" + reason +
+                "); they use the fallback margin. The stock HUD is unaffected.");
+    }
+
+    /// <summary>Records the resolved view, measurement source and geometry once per binding.</summary>
+    private void ReportPlacement(RectTransform viewRect, Transform overlay, bool glyphs,
+        float left, float right, float bottom, float top, float inset, Vector2 size, Vector2 anchored)
     {
         if (_placementLogged) return;
         _placementLogged = true;
-        Log.LogInfo($"hold-TAB status rows placed: view=" +
-                    (inCanvas ? $"{canvasRect!.name} {view.width:F0}x{view.height:F0}" : $"none (overlay rect)") +
-                    $", overlay='{overlay.name}' ({(overlay is RectTransform ? "RectTransform" : "Transform")})" +
-                    $", stock={stockWidth:F1}x{stockHeight:F1}, inset={inset:F1}" +
-                    $", size={size.x:F1}x{size.y:F1}, anchored=({anchored.x:F1}, {anchored.y:F1})");
-    }
-
-    /// <summary>Reports once that the rows are placed against the overlay instead of the canvas.</summary>
-    private void ReportViewFallback(Transform overlay, Rect view)
-    {
-        if (_viewFallbackReported) return;
-        _viewFallbackReported = true;
-        _report("the hold-TAB status rows are placed against the details overlay '" + overlay.name +
-                $"' ({view.width:F0}x{view.height:F0}) because no canvas rectangle was measurable; " +
-                "margins follow that overlay. The stock HUD is unaffected.");
-    }
-
-    private void ReportPlacementUnavailable()
-    {
-        if (_placementReported) return;
-        _placementReported = true;
-        var overlay = _overlay;
-        var canvas = overlay != null ? overlay.GetComponentInParent<Canvas>(true) : null;
-        var view = _canvasRect != null ? _canvasRect.rect : default;
-        _report("the hold-TAB status rows have no measurable view yet " +
-                $"(overlay={(overlay != null ? overlay.name : "gone")}, " +
-                $"rectTransform={overlay is RectTransform}, " +
-                $"canvas={(canvas != null ? canvas.name : "none")}, " +
-                $"view={view.width:F0}x{view.height:F0}); they keep their last placement. " +
-                "The stock HUD is unaffected.");
+        var view = viewRect.rect;
+        Log.LogInfo($"hold-TAB status rows placed: view={viewRect.name} {view.width:F0}x{view.height:F0}, " +
+                    $"overlay='{overlay.name}' ({(overlay is RectTransform ? "RectTransform" : "Transform")}), " +
+                    $"stock={(glyphs ? "glyph" : "rect")} gaps=({left:F1},{right:F1},{bottom:F1},{top:F1}), " +
+                    $"inset={inset:F1}, size={size.x:F1}x{size.y:F1}, anchored=({anchored.x:F1}, {anchored.y:F1})");
     }
 
     private void DestroyInjected()
@@ -367,13 +448,9 @@ internal sealed class TabStatusHud
             }
             coordinator.BuildHudText(out var upscalerLine, out var frameGenerationLine);
             var rows = upscalerLine + "\n" + frameGenerationLine;
-            // Placement is independent of the suffix repair above. An unmeasurable view is reported
-            // once and only leaves the rows at their current transform: never regress from
-            // visible-but-misplaced to hidden.
-            var placed = UpdatePlacement();
-            if (!placed) ReportPlacementUnavailable();
-            // A success re-arms the one-shot report so a later failure still reports once.
-            else _placementReported = false;
+            // Placement is independent of the suffix repair above. UpdatePlacement owns both the
+            // measured placement and the fallback, so a failure never leaves the rows at (0,0).
+            UpdatePlacement();
             if (!text.gameObject.activeSelf) text.gameObject.SetActive(true);
             if (!string.Equals(rows, _writtenRows, StringComparison.Ordinal) ||
                 !string.Equals(text.text, rows, StringComparison.Ordinal))
@@ -448,8 +525,8 @@ internal sealed class TabStatusHud
         _overlay = null;
         _canvasRect = null;
         _manager = null;
+        _placed = false;
         _placementReported = false;
-        _viewFallbackReported = false;
         _placementLogged = false;
     }
 

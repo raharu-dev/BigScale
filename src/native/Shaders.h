@@ -19,4 +19,6 @@ extern const unsigned char kGraphToScreenMotionHalfCso[];
 extern const unsigned int kGraphToScreenMotionHalfCsoSize;
 extern const unsigned char kGraphToScreenColorCso[];
 extern const unsigned int kGraphToScreenColorCsoSize;
+extern const unsigned char kNeuralMaskCso[];
+extern const unsigned int kNeuralMaskCsoSize;
 }

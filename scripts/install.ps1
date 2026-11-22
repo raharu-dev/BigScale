@@ -9,6 +9,11 @@
   refused while the game is running and refused when the destination holds files this package does
   not own, so an unrecognised file is never deleted. A pre-rename BigWalkDLSS installation is never
   migrated or removed: this installer fails and names what the user has to delete.
+
+  Files under providers/anr are the user's own manual ANR installation and are always preserved.
+  The only files this installer deletes are the exact notice files an older 1.0.0 BigScale payload
+  shipped individually, which THIRD-PARTY-NOTICES.txt now replaces, and the old ANR-INSTALL.txt,
+  which _ADDITIONAL_PROVIDERS.txt now replaces.
 #>
 [CmdletBinding()]
 param(
@@ -64,14 +69,30 @@ if ($IncludeAnrFg) {
     Write-Step "Merging the local ANR runtime ($($anrFiles.Count) files, never redistributed)"
 }
 
-# Ownership check: every existing file must either be part of this package or be runtime output.
-# The native log is only ever written at the plugin root; a same-named file further down is foreign.
+# Ownership check: every existing file must be part of this package, runtime output, a notice file
+# this release replaces, or the user's own ANR tree. The native log is only ever written at the
+# plugin root; a same-named file further down is foreign.
 $allowedRuntime = @('native.log')
-# ANR writes its own private Vulkan loader and a timestamped runtime log into its provider directory.
-# Those two exact shapes are runtime output of the local ANR tree, so they are tolerated only when
-# that tree was merged; anything else, including nested files or a root-level copy, is still refused.
-$allowedAnrRuntime = @('providers/anr/anr-vkloader.dll')
-$anrRuntimeLog = '^providers/anr/nr_fg-[0-9]{8}-[0-9]{6}\.log$'
+# providers/anr holds a manual installation the user made from Apex Compute's releases, so it is
+# theirs whether or not -IncludeAnrFg merges a local tree in this run.
+$anrPrefix = 'providers/anr/'
+# The 1.0.0 payload shipped its notices as individual files. These exact names are removed once the
+# combined notice is copied; they are never matched by wildcard or extension.
+$legacyNotices = @(
+    'APACHE-2.0.txt', 'FIDELITYFX-LICENSE.txt', 'FIDELITYFX-SDK-LICENSE.md',
+    'FIDELITYFX-SDK-THIRD-PARTY-NOTICES.md', 'MFG-UNLOCK-DASHDDOGY-LICENSE.txt',
+    'MFG-UNLOCK-FFX-API-LICENSE.txt', 'MFG-UNLOCK-LICENSE.txt', 'MFG-UNLOCK-MINHOOK-LICENSE.txt',
+    'MFG-UNLOCK-NEFH-LICENSE.txt', 'MINHOOK-LICENSE.txt', 'NOTICE.md',
+    'NVIDIA-RTX-SDK-LICENSE.txt', 'OPENVR-LICENSE.txt', 'STREAMLINE-LICENSE.txt',
+    'STREAMLINE-THIRD-PARTY-LICENSES.md', 'UNITY-COMPANION-LICENSE.txt', 'XESS-LICENSE.txt',
+    'XESS-THIRD-PARTY-PROGRAMS.txt'
+)
+# The previous payload shipped its optional-provider instructions as ANR-INSTALL.txt. The renamed
+# _ADDITIONAL_PROVIDERS.txt supersedes it, so the old name is removed once by exact name only.
+$replacedPayloadText = @('ANR-INSTALL.txt')
+$legacyPresent = @()
+$replacedPayloadPresent = @()
+$anrPreserved = @()
 if (Test-Path -LiteralPath $destination) {
     $owned = @{}
     foreach ($file in $payload) {
@@ -87,7 +108,12 @@ if (Test-Path -LiteralPath $destination) {
         $relative = $existing.FullName.Substring($destination.Length).TrimStart('\', '/').Replace('\', '/')
         if ($owned.ContainsKey($relative)) { continue }
         if ($allowedRuntime -contains $relative) { continue }
-        if ($IncludeAnrFg -and ($allowedAnrRuntime -contains $relative -or $relative -match $anrRuntimeLog)) { continue }
+        if ($legacyNotices -contains $relative) { $legacyPresent += $relative; continue }
+        if ($replacedPayloadText -contains $relative) { $replacedPayloadPresent += $relative; continue }
+        if ($relative.StartsWith($anrPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $anrPreserved += $relative
+            continue
+        }
         $foreign += $relative
     }
     if ($foreign.Count -gt 0) {
@@ -108,6 +134,19 @@ foreach ($file in $payload) {
     if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     Copy-Item -LiteralPath $file.FullName -Destination $target -Force
 }
+# The only deletions this installer performs. Exact names only, and only the ones that were present.
+foreach ($legacyName in $legacyPresent) {
+    Remove-Item -LiteralPath (Join-Path $destination $legacyName) -Force
+}
+if ($legacyPresent.Count -gt 0) {
+    Write-Step "Removed $($legacyPresent.Count) legacy notice files replaced by THIRD-PARTY-NOTICES.txt"
+}
+foreach ($replacedName in $replacedPayloadPresent) {
+    Remove-Item -LiteralPath (Join-Path $destination $replacedName) -Force
+}
+if ($replacedPayloadPresent.Count -gt 0) {
+    Write-Step "Removed $($replacedPayloadPresent.Count) superseded payload text file replaced by _ADDITIONAL_PROVIDERS.txt"
+}
 foreach ($file in $anrFiles) {
     $relative = $file.FullName.Substring($anrRoot.Length).TrimStart('\', '/')
     $target = Join-Path (Join-Path $destination 'providers/anr') $relative
@@ -116,6 +155,9 @@ foreach ($file in $anrFiles) {
     $parent = Split-Path -Parent $target
     if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+}
+if (-not $IncludeAnrFg -and $anrPreserved.Count -gt 0) {
+    Write-Step "Preserved $($anrPreserved.Count) existing ANR files under providers/anr"
 }
 
 $config = Join-Path $GameDir 'BepInEx/config/raharu.bigscale.cfg'

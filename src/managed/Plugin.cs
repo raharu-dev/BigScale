@@ -43,7 +43,6 @@ public sealed class Plugin : BasePlugin
     internal BigVisualsCompatibility Compatibility = null!;
     internal RenderingCallbacks? Callbacks { get; private set; }
     internal TabStatusHud? Hud { get; private set; }
-    internal KeyMenu Menu = null!;
     internal Harmony Harmony = null!;
 
     private UrpPostProcessHook? _hook;
@@ -53,6 +52,8 @@ public sealed class Plugin : BasePlugin
     private IntPtr _nativeLibrary;
     private bool _shutdown;
     private bool _settingsHookReported;
+    private bool _nativeLogUnavailable;
+    private bool _nativeLogFailureReported;
 
     public override void Load()
     {
@@ -65,13 +66,12 @@ public sealed class Plugin : BasePlugin
         ApplyNativeDiagnostics(Settings);
         Settings.Changed += OnSettingsChanged;
         Compatibility = new BigVisualsCompatibility();
-        Menu = new KeyMenu(Settings);
 
         RegisterInjectedComponents();
 
         Harmony = new Harmony(PluginGuid);
         var settingsHooks = SettingsPanel.Patches.Install(Harmony, ReportSettingsHooks);
-        Log.LogInfo($"settings panel hooks installed: {settingsHooks}/10.");
+        Log.LogInfo($"settings panel hooks installed: {settingsHooks}/{SettingsPanel.Patches.HookCount}.");
 
         // The hold-TAB rows are installed before any renderer-support early return: they must stay
         // usable (or silent) when BigScale is unsupported, faulted or still loading.
@@ -226,8 +226,39 @@ public sealed class Plugin : BasePlugin
 
     private void ReportHudHookFailure(string message) => Log.LogWarning(message);
 
+    /// <summary>
+    /// Applies <c>Diagnostics/NativeLog</c> to the loaded bridge. Called before <see cref="Native.Initialize"/>
+    /// so a disabled log is never created at all, and again whenever the setting changes.
+    /// </summary>
+    private void ApplyNativeLogSetting()
+    {
+        if (_shutdown || _nativeLibrary == IntPtr.Zero || _nativeLogUnavailable) return;
+        var enabled = Settings.NativeLog.Value;
+        try
+        {
+            Native.SetNativeLog(enabled ? 1 : 0);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // The installed bridge predates the export and always logs. Only a user who asked for the
+            // file to be off needs to hear about it; the default true value matches that old behaviour.
+            _nativeLogUnavailable = true;
+            if (!enabled)
+                Log.LogWarning("this BigScale.Native.dll predates Diagnostics/NativeLog, so it keeps writing " +
+                               "BepInEx/BigScale/native.log. Replace the bridge with the one from this release " +
+                               "to turn the file off.");
+        }
+        catch (Exception exception)
+        {
+            if (_nativeLogFailureReported) return;
+            _nativeLogFailureReported = true;
+            Log.LogWarning("could not apply Diagnostics/NativeLog: " + exception.Message);
+        }
+    }
+
     private void OnSettingsChanged()
     {
+        ApplyNativeLogSetting();
         try
         {
             Coordinator?.NotifySettingsChanged();
@@ -326,9 +357,14 @@ public sealed class Plugin : BasePlugin
             return false;
         }
 
+        // The native bridge logs by default, so only a disabled log needs a call, and it must happen
+        // before initialisation: SetLogDirectory creates the file. A true value stays silent, which
+        // also keeps an older bridge without the export from warning on the common upgrade path.
+        if (!Settings.NativeLog.Value) ApplyNativeLogSetting();
         if (Native.Initialize(pluginDirectory, dataDirectory) == 0)
         {
-            Coordinator!.SetSupportMessage("native bridge refused initialisation; see BepInEx/BigScale/native.log");
+            Coordinator!.SetSupportMessage("native bridge refused initialisation; see BepInEx/LogOutput.log; " +
+                                           "enable Diagnostics/NativeLog for BepInEx/BigScale/native.log");
             Log.LogError("BigScale inactive: BIGSCALE_Initialize returned 0.");
             return false;
         }
@@ -353,7 +389,6 @@ public sealed class Plugin : BasePlugin
         try
         {
             Settings.Changed -= OnSettingsChanged;
-            Menu?.Forget();
             SettingsPanel.DisposeAll();
             TabStatusHud.Instance = null;
             Hud?.Dispose();
@@ -364,6 +399,7 @@ public sealed class Plugin : BasePlugin
             _fgLoop?.Uninstall();
             _fgHook?.Uninstall();
             Coordinator?.PlayerMotion.Shutdown();
+            Coordinator?.ShutdownNeural();
             Coordinator?.Ownership.Restore();
             Coordinator?.Compatibility.Reapply();
             // The presenter child window and detours are inert passthrough after this; the detours

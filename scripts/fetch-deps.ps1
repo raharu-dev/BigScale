@@ -5,8 +5,9 @@
 
 .DESCRIPTION
   Fetches each dependency at the exact commit or archive this project is bound to, verifies the
-  pinned runtime hashes, and leaves everything under third_party/. Nothing is published anywhere and
-  nothing here is redistributed: scripts/build.ps1 stages only the files the release payload needs.
+  pinned runtime hashes, and leaves everything under third_party/. The fetched SDK trees and archives
+  are never tracked or redistributed; scripts/build.ps1 stages only the redistributable runtimes and
+  notice files the release payload needs.
 #>
 [CmdletBinding()]
 param(

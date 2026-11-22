@@ -75,6 +75,9 @@ internal sealed class UpscalingPass
                 var depth = ResolveTexture(data.depthTexture);
                 var motion = ResolveTexture(data.halfCoCTexture);
                 var output = ResolveTexture(data.destination);
+                // The mask is optional: it rides in the unused pong slot and only exists when the
+                // graph recorded a character pass this frame. A stale graph resolves its own import.
+                var mask = ResolveTexture(data.pongTexture);
                 if (!FramePolicy.Satisfied(operation, color != null, frame.OutputWidth, frame.OutputHeight,
                         depth != null, motion != null, output != null, out var missing))
                 {
@@ -94,6 +97,11 @@ internal sealed class UpscalingPass
                     packet.Depth = depth != null ? depth.GetNativeTexturePtr() : IntPtr.Zero;
                     packet.Motion = motion != null ? motion.GetNativeTexturePtr() : IntPtr.Zero;
                     packet.Output = output != null ? output.GetNativeTexturePtr() : IntPtr.Zero;
+                    // A missing mask is reported as null/0/0 so the native stage runs unmasked rather
+                    // than sampling an unrelated texture from a previous frame.
+                    packet.NeuralMask = mask != null ? mask.GetNativeTexturePtr() : IntPtr.Zero;
+                    packet.NeuralMaskWidth = mask != null ? mask.width : 0;
+                    packet.NeuralMaskHeight = mask != null ? mask.height : 0;
                     // The output obligation was reserved when the pass was recorded; a packet the
                     // bridge refuses settles it here because no retirement will ever arrive.
                     var queued = Native.QueueFrame(ref packet);
@@ -286,7 +294,7 @@ internal sealed class UpscalingPass
             };
         }
         return Record(renderGraph, color, TextureHandle.nullHandle, TextureHandle.nullHandle, TextureHandle.nullHandle,
-            lease, "BigScale.Probe", false);
+            TextureHandle.nullHandle, lease, "BigScale.Probe", false);
     }
 
     /// <summary>
@@ -323,7 +331,7 @@ internal sealed class UpscalingPass
             };
         }
         return Record(renderGraph, color, TextureHandle.nullHandle, TextureHandle.nullHandle,
-            TextureHandle.nullHandle, lease, "BigScale.Switch", false);
+            TextureHandle.nullHandle, TextureHandle.nullHandle, lease, "BigScale.Switch", false);
     }
 
     /// <summary>
@@ -357,13 +365,17 @@ internal sealed class UpscalingPass
         };
         }
         return Record(renderGraph, color, TextureHandle.nullHandle, TextureHandle.nullHandle,
-            TextureHandle.nullHandle, lease, "BigScale.Recovery", false);
+            TextureHandle.nullHandle, TextureHandle.nullHandle, lease, "BigScale.Recovery", false);
     }
 
     /// <summary>Records the reconstruction pass and queues one packet per logical eye.</summary>
+    /// <param name="mask">
+    /// Optional character-coverage texture at the output extent, recorded by the caller's mask pass
+    /// this frame. An invalid handle keeps the reconstruction unmasked.
+    /// </param>
     internal bool RecordReconstruction(RenderGraph renderGraph, TextureHandle color, TextureHandle depth,
-        TextureHandle motion, TextureHandle output, Native.Frame[] frames, int count, IntPtr renderEvent,
-        uint resourceTag)
+        TextureHandle motion, TextureHandle output, TextureHandle mask, Native.Frame[] frames, int count,
+        IntPtr renderEvent, uint resourceTag)
     {
         var lease = TakeLease();
         if (lease == null) return false;
@@ -374,7 +386,7 @@ internal sealed class UpscalingPass
             lease.ResourceTag = resourceTag;
             Array.Copy(frames, lease.Frames, count);
         }
-        return Record(renderGraph, color, depth, motion, output, lease, "BigScale.Reconstruction", true);
+        return Record(renderGraph, color, depth, motion, output, mask, lease, "BigScale.Reconstruction", true);
     }
 
     private Lease? TakeLease()
@@ -398,7 +410,7 @@ internal sealed class UpscalingPass
     }
 
     private bool Record(RenderGraph renderGraph, TextureHandle color, TextureHandle depth, TextureHandle motion,
-        TextureHandle output, Lease lease, string label, bool writesOutput)
+        TextureHandle output, TextureHandle mask, Lease lease, string label, bool writesOutput)
     {
         var builder = renderGraph.AddUnsafePass<PassData>(label, out var passData);
         try
@@ -430,6 +442,13 @@ internal sealed class UpscalingPass
             {
                 passData.halfCoCTexture = motion;
                 common.UseTexture(ref motion, AccessFlags.Read);
+            }
+            if (mask.IsValid())
+            {
+                // The mask pass already writes this texture, so a read dependency here makes the
+                // graph run the character draw before the reconstruction callback queues frames.
+                passData.pongTexture = mask;
+                common.UseTexture(ref mask, AccessFlags.Read);
             }
             if (writesOutput && output.IsValid())
             {

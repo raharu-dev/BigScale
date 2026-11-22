@@ -28,6 +28,10 @@ namespace
 constexpr char kProjectId[] = "dce2ec10-c62e-4ec2-a24e-7368ff734a44";
 constexpr uint32_t kSwapchainBuffers = 3;
 constexpr D3D12_RESOURCE_STATES kReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+// ANR is never redistributed, so the missing-runtime message points at the mod page instead of a
+// path the user may never have had.
+constexpr char kAnrMissing[] =
+    "ANR FG runtime is missing; check the mod page for how to install ANR";
 
 void TransitionTo(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES& tracked,
                   D3D12_RESOURCE_STATES after)
@@ -65,21 +69,28 @@ NgxFgProvider::NgxFgProvider(Flavor flavor) : flavor_(flavor) {}
 
 const char* NgxFgProvider::Name() const { return flavor_ == Flavor::Nvidia ? "NVIDIA DLSS-FG" : "ANR"; }
 
+std::wstring AnrModulePath(const std::wstring& providerDirectory)
+{
+    if (providerDirectory.empty()) return {};
+    std::wstring path = providerDirectory;
+    if (path.back() != L'\\' && path.back() != L'/') path += L'\\';
+    path += L"nvngx_dlssg.dll";
+    return path;
+}
+
 bool NgxFgProvider::LoadAnr(std::string& reason)
 {
     if (module_ != nullptr) return true;
-    std::wstring path = anrDirectory_.empty() ? std::wstring() : anrDirectory_;
+    const std::wstring path = AnrModulePath(anrDirectory_);
     if (path.empty())
     {
-        reason = "ANR FG runtime is missing: providers/anr/nvngx_dlssg.dll";
+        reason = kAnrMissing;
         return false;
     }
-    if (path.back() != L'\\' && path.back() != L'/') path += L'\\';
-    path += L"nvngx_dlssg.dll";
     module_ = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (module_ == nullptr)
     {
-        reason = "ANR FG runtime is missing: providers/anr/nvngx_dlssg.dll";
+        reason = kAnrMissing;
         Log("ANR: provider module load failed (error=%lu).", static_cast<unsigned long>(GetLastError()));
         return false;
     }
@@ -95,6 +106,30 @@ bool NgxFgProvider::LoadAnr(std::string& reason)
     if (!anr_.init || !anr_.create || !anr_.evaluate || !anr_.release || !anr_.shutdown1)
     {
         reason = "the ANR runtime is missing its frame-generation entry points";
+        return false;
+    }
+    return true;
+}
+
+bool NgxFgProvider::Preflight(const FgInit& init, std::string& reason)
+{
+    if (flavor_ != Flavor::Anr) return true;
+    // Match InitializeAnr's first check: HAGS is a prerequisite for every NGX frame-generation
+    // provider, and a HAGS-off device would be invalidated instead of returning a clean error.
+    if (!HardwareSchedulingEnabled(init.device, reason)) return false;
+    if (init.runtimeDirectory.empty())
+    {
+        reason = kAnrMissing;
+        return false;
+    }
+    std::wstring directory = init.runtimeDirectory;
+    if (directory.back() != L'\\' && directory.back() != L'/') directory += L'\\';
+    directory += L"providers\\anr";
+    const std::wstring module = AnrModulePath(directory);
+    const DWORD attributes = GetFileAttributesW(module.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+    {
+        reason = kAnrMissing;
         return false;
     }
     return true;
@@ -207,14 +242,15 @@ bool NgxFgProvider::InitializeAnr(const FgInit& init, std::string& reason)
     map_.Reset();
     params_ = &map_;
     if (anr_.populate != nullptr) anr_.populate(params_);
-    // ANR publishes the same capability key through its populated map. A missing value keeps the
-    // safe one-generated-frame contract instead of guessing.
+    // ANR publishes the same capability key through its populated map, but its current release
+    // supports one generated frame per source: 2x total. A missing value keeps that same safe
+    // one-generated-frame contract instead of guessing.
     int multiFrameCountMax = 0;
     uint32_t generated = 1;
     if (!NVSDK_NGX_FAILED(params_->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &multiFrameCountMax)) &&
         multiFrameCountMax > 0)
         generated = static_cast<uint32_t>(multiFrameCountMax);
-    if (generated > 5) generated = 5;
+    if (generated > 1) generated = 1;
     maximumMultiplier_ = generated + 1;
     Log("%s: capability MultiFrameCountMax=%d total=%ux", Name(), multiFrameCountMax, maximumMultiplier_);
     (void)init;
@@ -804,36 +840,29 @@ bool NgxFgProvider::Record(FgPresent& present, std::string& reason)
                 static_cast<unsigned>(evaluated), index);
             return false;
         }
-    }
-    // The application closes and executes the list the SDK recorded into, then prepares the
-    // generated images. If the SDK already closed it, executing a closed list is legal.
-    if (!SubmitList(list, sdkList_, present.sourceFenceValue, reason)) return false;
-
-    // A second list performs the resource transitions and the interpolation-disable readback. The
-    // queue is already ordered behind the SDK work by the first submission.
-    ID3D12GraphicsCommandList* copy = nullptr;
-    if (!BeginListRing(copyList_, reason, &copy)) return false;
-    for (uint32_t i = 0; i < slots; i++)
-    {
-        Dx12Interop::Transition(copy, slots_[i].image.Get(), slots_[i].imageState,
+        // The interpolation-disable verdict is copied here, on the list the SDK just recorded into,
+        // so the readback is queued behind that evaluation. Recording it in a second list would cost
+        // a whole queue round-trip before the first generated image could be presented.
+        GeneratedSlot& written = slots_[index - 1];
+        Dx12Interop::Transition(list, written.disable.Get(), written.disableState,
             D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Dx12Interop::Transition(copy, slots_[i].disable.Get(), slots_[i].disableState,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
-        copy->CopyResource(slots_[i].readback.Get(), slots_[i].disable.Get());
-        Dx12Interop::Transition(copy, slots_[i].disable.Get(), slots_[i].disableState,
+        list->CopyResource(written.readback.Get(), written.disable.Get());
+        Dx12Interop::Transition(list, written.disable.Get(), written.disableState,
             D3D12_RESOURCE_STATE_COMMON);
     }
+    // The application closes and executes the list the SDK recorded into. If the SDK already closed
+    // it, executing a closed list is legal.
     if (present.hudless != nullptr)
-        Dx12Interop::Transition(copy, present.hudless, *present.hudlessState, D3D12_RESOURCE_STATE_COMMON);
-    Dx12Interop::Transition(copy, present.motion, *present.motionState, D3D12_RESOURCE_STATE_COMMON);
-    Dx12Interop::Transition(copy, present.depth, *present.depthState, D3D12_RESOURCE_STATE_COMMON);
-    Dx12Interop::Transition(copy, present.color, *present.colorState, D3D12_RESOURCE_STATE_COMMON);
+        Dx12Interop::Transition(list, present.hudless, *present.hudlessState, D3D12_RESOURCE_STATE_COMMON);
+    Dx12Interop::Transition(list, present.motion, *present.motionState, D3D12_RESOURCE_STATE_COMMON);
+    Dx12Interop::Transition(list, present.depth, *present.depthState, D3D12_RESOURCE_STATE_COMMON);
+    Dx12Interop::Transition(list, present.color, *present.colorState, D3D12_RESOURCE_STATE_COMMON);
     pendingReal_ = present.color;
     pendingColorState_ = present.colorState;
-    if (!SubmitList(copy, copyList_, 0, reason)) return false;
+    if (!SubmitList(list, sdkList_, present.sourceFenceValue, reason)) return false;
     present.executed = true;
     present.submissionFence = submitFence_.Get();
-    present.submissionValue = copyList_.value;
+    present.submissionValue = sdkList_.value;
     pairSlots_ = slots;
     return true;
 }

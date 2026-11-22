@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(BigScaleNative LANGUAGES C CXX)
 
+# The bridge exports five NGX entry points so the DLSS neural-rendering runtime sees a caller named
+# nvngx.dll. The static NGX loader already defines the real symbols, so the exports are name aliases
+# from a module-definition file; the bridge is linked to nvngx.dll at runtime by the neural stage.
+set(BIGSCALE_NGX_FORWARDER_DEF "${CMAKE_CURRENT_SOURCE_DIR}/NvngxForwarder.def")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEF:${BIGSCALE_NGX_FORWARDER_DEF}")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEF:${BIGSCALE_NGX_FORWARDER_DEF}")
+
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "BigScale.Native requires Windows x64 and MSVC.")
 endif()
@@ -74,6 +81,9 @@ list(APPEND BIGSCALE_DX12_BACKEND_SOURCES
   Dx12Interop.cpp Dx12Interop.h
   ContextState.cpp ContextState.h
   NgxSynchronization.cpp NgxSynchronization.h
+  NeuralRendering.cpp NeuralRendering.h
+  NvngxForwarder.cpp NvngxForwarder.def
+  DlssNrRuntime.cpp DlssNrRuntime.h
   FrameGeneration.cpp FrameGeneration.h FrameGenerationAbi.h FrameGenerationApi.cpp
   VrFrameGenerationAbi.h
   vr/VrFrameGeneration.cpp vr/VrFrameGeneration.h
@@ -118,6 +128,7 @@ list(APPEND BIGSCALE_DX12_BACKEND_SOURCES
   fg/FrameGenerationProvider.h
   fg/FrameGenerationResources.cpp fg/FrameGenerationResources.h
   fg/FgCadence.cpp fg/FgCadence.h
+  fg/FgAdaptiveCadence.cpp fg/FgAdaptiveCadence.h
   fg/FgCapture.cpp fg/FgCapture.h
   fg/FgReadback.cpp fg/FgReadback.h
   fg/FgTestObserver.cpp fg/FgTestObserver.h
@@ -194,9 +205,10 @@ message(STATUS "Using fxc: ${FXC_EXECUTABLE}")
 
 # symbol name = source name. The generated arrays are k<Symbol>Cso / k<Symbol>CsoSize.
 set(SHADER_SYMBOLS ConvertColor ConvertDepth ConvertMotion Upsample ResampleMotion
-    GraphToScreenDepth GraphToScreenMotion GraphToScreenMotionHalf GraphToScreenColor)
+    GraphToScreenDepth GraphToScreenMotion GraphToScreenMotionHalf GraphToScreenColor NeuralMask)
 set(SHADER_FILES convert_color convert_depth convert_motion upsample resample_motion
-    graph_to_screen_depth graph_to_screen_motion graph_to_screen_motion_half graph_to_screen_color)
+    graph_to_screen_depth graph_to_screen_motion graph_to_screen_motion_half graph_to_screen_color
+    neural_mask)
 set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUTPUT_DIR}")
 
@@ -262,8 +274,13 @@ target_link_libraries(BigScale.Native PRIVATE d3d11 d3d12 dxgi dxguid gdi32 vers
 set_property(TARGET BigScale.Native PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 target_compile_options(BigScale.Native PRIVATE /W4 /EHsc /utf-8 /Zi)
 # Emit a program database next to the bridge so the diagnostics archive can carry stack symbols.
-target_link_options(BigScale.Native PRIVATE /DEBUG /OPT:REF)
-set_target_properties(BigScale.Native PROPERTIES LINK_FLAGS "/DEBUG /OPT:REF")
+# /PDBALTPATH records only the file name in the DLL's debug directory, so the shipped binary does not
+# name the local build path. It is set per target and with the literal name: the %_PDB% macro is not
+# expanded by this toolchain, and a global linker flag would also rewrite the check harness's PDB.
+target_link_options(BigScale.Native PRIVATE /DEBUG /OPT:REF
+  "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/NvngxForwarder.def")
+set_target_properties(BigScale.Native PROPERTIES LINK_FLAGS
+  "/DEBUG /OPT:REF /PDBALTPATH:BigScale.Native.pdb /DEF:${CMAKE_CURRENT_SOURCE_DIR}/NvngxForwarder.def")
 set_property(TARGET BigScale.Native PROPERTY MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
 set_target_properties(BigScale.Native PROPERTIES
   PREFIX ""
@@ -289,6 +306,15 @@ if(BIGSCALE_BUILD_CHECKS)
     ${BIGSCALE_UPSCALER_SOURCES}
     ${BIGSCALE_DX12_BACKEND_SOURCES})
   add_dependencies(BigScaleChecks BigScale.NativeShaders)
+  # The neural checks install the bridge as the nvngx.dll forwarder; an EXE cannot be loaded as a
+  # DLL, so the real bridge is built and copied beside the harness. The packaged game uses its own
+  # module and never sets BIGSCALE_NVNGX_FORWARDER.
+  add_dependencies(BigScaleChecks BigScale.Native)
+  add_custom_command(TARGET BigScaleChecks POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:BigScale.Native>"
+            "$<TARGET_FILE_DIR:BigScaleChecks>/BigScale.Native.dll"
+    COMMENT "Staging BigScale.Native.dll next to the offline checks"
+    VERBATIM)
   target_compile_features(BigScaleChecks PRIVATE cxx_std_17)
   target_compile_definitions(BigScaleChecks PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
   if(BIGSCALE_BUILD_FSR)
@@ -303,8 +329,11 @@ if(BIGSCALE_BUILD_CHECKS)
   target_link_libraries(BigScaleChecks PRIVATE d3d11 d3d12 dxgi dxguid gdi32 version "${NGX_STATIC_LIBRARY}" ${BIGSCALE_FSR_LIBRARIES} ${BIGSCALE_MINHOOK_LIB})
   target_compile_options(BigScaleChecks PRIVATE /W4 /EHsc /utf-8 /Zi)
   # Symbols let the harness's crash handler name the faulting frame instead of an address.
-  target_link_options(BigScaleChecks PRIVATE /DEBUG /OPT:REF)
+  target_link_options(BigScaleChecks PRIVATE /DEBUG /OPT:REF
+    "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/NvngxForwarder.def")
   set_property(TARGET BigScaleChecks PROPERTY MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
+  set_property(TARGET BigScaleChecks PROPERTY LINK_FLAGS
+    "/DEBUG /OPT:REF /DEF:${CMAKE_CURRENT_SOURCE_DIR}/NvngxForwarder.def")
   set_property(TARGET BigScaleChecks PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
   set_target_properties(BigScaleChecks PROPERTIES
     OUTPUT_NAME "BigScaleChecks"

@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using BigScale.Core;
 using BepInEx.Logging;
 using HarmonyLib;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using TMPro;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
 namespace BigScale;
@@ -33,6 +35,9 @@ internal sealed class SettingsPanel
     private static readonly Dictionary<int, SettingsPanel> PanelsByMenu = new();
     private static readonly Dictionary<int, SettingsPanel> PanelsByHost = new();
 
+    /// <summary>Live slider rows by Slider instance id, so a UI release can commit its preview.</summary>
+    private static readonly Dictionary<int, RowBinding> SliderBindings = new();
+
     /// <summary>Menus whose stock <c>Start</c> has run, so building cannot race the game's own setup.</summary>
     private static readonly Dictionary<int, SettingsMenu> StartedMenus = new();
 
@@ -45,6 +50,36 @@ internal sealed class SettingsPanel
         internal TMP_Text Caption = null!;
         internal TMP_Text Value = null!;
         internal string CaptionText = "";
+        internal SettingsPanel Owner = null!;
+        internal BepInEx.Configuration.ConfigEntry<float>? SliderEntry;
+        internal float SliderPreview;
+        internal bool SliderPending;
+    }
+
+    /// <summary>
+    /// One injected settings page. The panel owns the list; <c>_pages[0]</c> is always the
+    /// <c>Upscaling</c> page and every existing field below aliases into it, so the stock page keeps
+    /// exactly the code path it had before the second page existed.
+    /// </summary>
+    private sealed class Page
+    {
+        internal string Label = "";
+        internal string ObjectName = "";
+        internal SettingsCatagory Catagory = null!;
+        internal Transform RowParent = null!;
+        internal readonly List<RowBinding> Bindings = new();
+        internal readonly Dictionary<string, RowBinding> BindingsByKey = new();
+        internal SettingsRow[] Navigation = Array.Empty<SettingsRow>();
+        internal SettingsRow[] All = Array.Empty<SettingsRow>();
+        internal GameObject? CloneRoot;
+        internal GameObject? CategoryButton;
+        internal Selectable? ButtonSelectable;
+        internal IntPtr ButtonPointer;
+        internal CategorySnapshot? ButtonSnapshot;
+        internal bool LocalisationStripped;
+
+        /// <summary>Neural Rendering schema row keyed by the cloned <see cref="SettingsRow"/> instance id.</summary>
+        internal readonly Dictionary<int, NeuralRenderingRow> NeuralByRow = new();
     }
 
     private sealed class CategorySnapshot
@@ -88,10 +123,7 @@ internal sealed class SettingsPanel
     }
 
     private readonly SettingsMenu _menu;
-    private readonly SettingsCatagory _catagory;
-    private readonly SettingsRow[] _navigation;
-    private readonly SettingsRow[] _all;
-    private readonly List<RowBinding> _bindings = new();
+    private readonly List<Page> _pages = new();
     private readonly List<CategorySnapshot> _categoryOrder = new();
 
     private RowBinding _enabledRow = null!;
@@ -103,9 +135,6 @@ internal sealed class SettingsPanel
     // selectable styling and navigation exactly once.
     private bool _vrLocked;
 
-    private GameObject? _categoryButton;
-    private IntPtr _categoryButtonPointer;
-    private CategorySnapshot? _categoryButtonSnapshot;
     private CategorySnapshot? _graphicsSnapshot;
     private RectTransform? _categoryParent;
     private readonly List<LayoutGroupSnapshot> _layoutGroups = new();
@@ -115,20 +144,43 @@ internal sealed class SettingsPanel
     private int _columnId;
     private int _graphicsParentId;
     private bool _distinctTabParents;
-    private GameObject? _cloneRoot;
-    private bool _localisationStripped;
     private bool _refreshing;
     private bool _disposed;
+
+    private Page Primary => _pages[0];
+
+    // Page-0 aliases. Every existing code path keeps reading and writing through these names while
+    // the panel itself owns the complete page list.
+    private SettingsCatagory _catagory => Primary.Catagory;
+    private SettingsRow[] _navigation => Primary.Navigation;
+    private SettingsRow[] _all => Primary.All;
+    private List<RowBinding> _bindings => Primary.Bindings;
+    private GameObject? _cloneRoot => Primary.CloneRoot;
+
+    private GameObject? _categoryButton
+    {
+        get => Primary.CategoryButton;
+        set => Primary.CategoryButton = value;
+    }
+
+    private CategorySnapshot? _categoryButtonSnapshot
+    {
+        get => Primary.ButtonSnapshot;
+        set => Primary.ButtonSnapshot = value;
+    }
+
+    private bool _localisationStripped
+    {
+        get => Primary.LocalisationStripped;
+        set => Primary.LocalisationStripped = value;
+    }
 
     private ModSettings Settings => Plugin.Instance!.Settings;
     private RenderCoordinator? Coordinator => Plugin.Instance!.Coordinator;
 
-    private SettingsPanel(SettingsMenu menu, SettingsCatagory catagory, SettingsRow[] navigation, SettingsRow[] all)
+    private SettingsPanel(SettingsMenu menu)
     {
         _menu = menu;
-        _catagory = catagory;
-        _navigation = navigation;
-        _all = all;
     }
 
     /// <summary>The live panel built for this exact menu instance, or null.</summary>
@@ -149,8 +201,17 @@ internal sealed class SettingsPanel
         return panel;
     }
 
-    /// <summary>True when the category page is the one currently shown.</summary>
-    internal bool IsVisible => !_disposed && _catagory != null && _catagory.gameObject.activeInHierarchy;
+    /// <summary>True when any of this panel's category pages is the one currently shown.</summary>
+    internal bool IsVisible
+    {
+        get
+        {
+            if (_disposed) return false;
+            foreach (var page in _pages)
+                if (page.Catagory != null && page.Catagory.gameObject.activeInHierarchy) return true;
+            return false;
+        }
+    }
 
     /// <summary>True while any Upscaling page is on screen; used to suspend frame generation.</summary>
     internal static bool AnyVisible
@@ -172,16 +233,6 @@ internal sealed class SettingsPanel
         if (menu == null) return false;
         var id = menu.GetInstanceID();
         return StartedMenus.TryGetValue(id, out var started) && started == menu;
-    }
-
-    /// <summary>Reports why construction failed for this exact menu, without retrying it.</summary>
-    internal static bool TryGetBuildFailure(SettingsMenu menu, out string reason)
-    {
-        reason = "";
-        if (menu == null) return false;
-        if (!BuildFailures.TryGetValue(menu.GetInstanceID(), out var recorded)) return false;
-        reason = recorded;
-        return true;
     }
 
     /// <summary>
@@ -225,7 +276,7 @@ internal sealed class SettingsPanel
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not attach the Upscaling panel host: " + exception.Message);
+                Log.LogWarning("Could not attach the BigScale settings panel host: " + exception.Message);
             }
         }
 
@@ -255,21 +306,25 @@ internal sealed class SettingsPanel
         if (source.catagoryButton == null) return (null, "the graphics category button is missing");
         if (source.transform.parent == null) return (null, "the graphics category has no parent container");
 
-        // Typed template: an options row has arrows and a visible Variable child. This page has no
-        // slider dependency at all, so a stock graphics table without one still builds.
+        // Typed templates: an options row has arrows and a visible Variable child; a slider row has a
+        // Slider and a resolvable VariableDisplay or sliderLabel. The Upscaling page has no slider
+        // dependency at all, so a stock graphics table without one still builds (only NR sliders drop).
         SettingsRow? optionsTemplate = null;
+        SettingsRow? sliderTemplate = null;
         foreach (var row in sourceRows)
         {
             if (row == null) continue;
-            if (row.slider == null && row.leftButton != null && row.rightButton != null &&
-                HasResolvableTmp(row.transform, "Variable"))
-                optionsTemplate ??= row;
+            if (optionsTemplate == null && row.slider == null && row.leftButton != null &&
+                row.rightButton != null && HasResolvableTmp(row.transform, "Variable"))
+                optionsTemplate = row;
+            if (sliderTemplate == null && row.slider != null &&
+                (HasResolvableTmp(row.transform, "VariableDisplay") || row.sliderLabel != null))
+                sliderTemplate = row;
         }
         if (optionsTemplate == null)
             return (null, "the graphics category has no options row with a Variable label");
 
         GameObject? staging = null;
-        GameObject? cloneRoot = null;
         SettingsPanel? panel = null;
 
         void Cleanup()
@@ -280,119 +335,258 @@ internal sealed class SettingsPanel
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not clean up a failed Upscaling panel build: " + exception.Message);
+                Log.LogWarning("Could not clean up a failed BigScale settings panel build: " + exception.Message);
             }
-            if (cloneRoot != null) UnityEngine.Object.Destroy(cloneRoot);
             if (staging != null) UnityEngine.Object.Destroy(staging);
         }
 
-        // The page, its rows and the tab are all created under an inactive staging root first.
+        // The pages, their rows and the tabs are all created under an inactive staging root first.
         try
         {
             staging = new GameObject("BigScale.Staging");
             staging.SetActive(false);
             staging.transform.SetParent(source.transform.parent, false);
-            cloneRoot = UnityEngine.Object.Instantiate(source.gameObject, staging.transform);
-            cloneRoot.name = SettingsObjectName;
-            cloneRoot.SetActive(false);
 
-            var catagory = cloneRoot.GetComponent<SettingsCatagory>();
-            if (catagory == null)
+            panel = new SettingsPanel(menu);
+
+            var upscaling = BuildPage(panel, source, staging.transform, optionsTemplate, sliderTemplate, null);
+            var upscalingPage = upscaling.Page;
+            if (upscalingPage == null)
             {
                 Cleanup();
-                return (null, "the cloned category lost its SettingsCatagory component");
+                return (null, upscaling.Failure);
             }
-            var clonedRows = catagory.rows;
-            if (clonedRows == null || clonedRows.Length == 0 || clonedRows[0] == null)
+            panel._pages.Add(upscalingPage);
+
+            // The gate is read exactly when the pages are built. One missing Neural Rendering page
+            // never prevents the other page or the Upscaling page from working.
+            if (panel.Settings.DLSS5Enabled.Value)
             {
-                Cleanup();
-                return (null, "the cloned category did not reproduce its rows");
-            }
-            var rowParent = clonedRows[0].transform.parent;
-            if (rowParent == null || !rowParent.IsChildOf(cloneRoot.transform))
-            {
-                Cleanup();
-                return (null, "the cloned category's rows are not its own children");
-            }
-            for (var i = 0; i < clonedRows.Length; i++)
-            {
-                if (clonedRows[i] == null) continue;
-                if (!clonedRows[i].transform.IsChildOf(cloneRoot.transform) ||
-                    clonedRows[i].transform.parent != rowParent)
+                foreach (var pageDef in NeuralRenderingSchema.Pages)
                 {
-                    Cleanup();
-                    return (null, "a cloned category row points outside the cloned page");
+                    var neural = BuildPage(panel, source, staging.transform, optionsTemplate, sliderTemplate,
+                        pageDef);
+                    var neuralPage = neural.Page;
+                    if (neuralPage != null)
+                    {
+                        panel._pages.Add(neuralPage);
+                        continue;
+                    }
+                    Log.LogWarning($"Could not build the {pageDef.Label} settings category: {neural.Failure}");
                 }
-                clonedRows[i].gameObject.SetActive(false);
-                UnityEngine.Object.Destroy(clonedRows[i].gameObject);
             }
 
-            // The schema is the only source of rows: a control that is not declared there can never
-            // appear on the page, even if an older configuration still carries its key.
-            var bindings = new Dictionary<string, RowBinding>();
-            var ordered = new List<RowBinding>();
-            var navigation = new List<SettingsRow>();
-            var all = new List<SettingsRow>();
-            foreach (var row in SettingsPanelSchema.Rows)
-            {
-                var binding = CreateBinding(optionsTemplate, staging.transform, row.Key, row.Caption, true,
-                    out var bindFailure);
-                if (binding == null)
-                {
-                    Cleanup();
-                    return (null, bindFailure);
-                }
-                bindings[row.Key] = binding;
-                ordered.Add(binding);
-                all.Add(binding.Row);
-                navigation.Add(binding.Row);
-            }
+            var primary = panel._pages[0];
+            panel._enabledRow = primary.BindingsByKey[SettingsPanelSchema.EnabledKey];
+            panel._upscalerRow = primary.BindingsByKey[SettingsPanelSchema.UpscalerKey];
+            panel._modeRow = primary.BindingsByKey[SettingsPanelSchema.ModeKey];
+            panel._frameGenerationRow = primary.BindingsByKey[SettingsPanelSchema.FrameGenerationKey];
+            panel._frameMultiplierRow = primary.BindingsByKey[SettingsPanelSchema.FrameMultiplierKey];
 
-            panel = new SettingsPanel(menu, catagory, navigation.ToArray(), all.ToArray())
-            {
-                _enabledRow = bindings[SettingsPanelSchema.EnabledKey],
-                _upscalerRow = bindings[SettingsPanelSchema.UpscalerKey],
-                _modeRow = bindings[SettingsPanelSchema.ModeKey],
-                _frameGenerationRow = bindings[SettingsPanelSchema.FrameGenerationKey],
-                _frameMultiplierRow = bindings[SettingsPanelSchema.FrameMultiplierKey],
-                _cloneRoot = cloneRoot,
-            };
-            panel._bindings.AddRange(ordered);
-
-            foreach (var row in SettingsPanelSchema.Rows)
-                panel.Configure(bindings[row.Key]);
-
-            catagory.rows = new Il2CppReferenceArray<SettingsRow>(all.ToArray());
-
-            if (!panel.TryOwnCategoryColumn(source, staging!.transform, out var layoutFailure))
+            if (!panel.TryOwnCategoryColumn(source, staging.transform, out var layoutFailure))
             {
                 Cleanup();
                 return (null, layoutFailure);
             }
 
-            // Move the finished rows out of staging into the page. The page itself stays inactive until
-            // the player opens this category.
-            foreach (var binding in panel._bindings)
+            // Move the finished rows out of staging into their page. Every page stays inactive until
+            // the player opens its category.
+            foreach (var page in panel._pages)
             {
-                binding.Row.transform.SetParent(rowParent, false);
-                binding.Row.gameObject.SetActive(true);
+                foreach (var binding in page.Bindings)
+                {
+                    binding.Row.transform.SetParent(page.RowParent, false);
+                    binding.Row.gameObject.SetActive(true);
+                }
             }
-            // The staging root was only a construction sandbox. The finished page takes the stock
+            // The staging root was only a construction sandbox. Each finished page takes the stock
             // Graphics page's place in the real hierarchy while staying inactive until Show.
-            cloneRoot.transform.SetParent(source.transform.parent, false);
+            foreach (var page in panel._pages)
+            {
+                if (page.CloneRoot != null)
+                    page.CloneRoot.transform.SetParent(source.transform.parent, false);
+            }
             UnityEngine.Object.Destroy(staging);
             staging = null;
 
-            Log.LogInfo($"Upscaling settings category built from {all.Count} bound rows " +
+            Log.LogInfo($"{primary.Label} settings category built from {primary.All.Length} bound rows " +
                         $"(menu id={menu.GetInstanceID()}, column id={panel._columnId}, " +
                         $"graphics tab parent id={panel._graphicsParentId}, " +
                         $"distinct tab parents={(panel._distinctTabParents ? "yes" : "no")}).");
+            for (var i = 1; i < panel._pages.Count; i++)
+            {
+                var page = panel._pages[i];
+                Log.LogInfo($"{page.Label} settings category built from {page.All.Length} bound rows " +
+                            $"(menu id={menu.GetInstanceID()}, column id={panel._columnId}).");
+            }
             return (panel, null);
         }
         catch (Exception exception)
         {
             Cleanup();
             return (null, "build threw " + exception.GetType().Name + ": " + exception.Message);
+        }
+    }
+
+    /// <summary>
+    /// Clones the stock Graphics page, replaces its rows with one schema and binds the controls. The
+    /// page is left under the inactive staging root; <see cref="BuildCore"/> moves it into place only
+    /// after the whole column validates.
+    /// </summary>
+    private static (Page? Page, string Failure) BuildPage(SettingsPanel panel, SettingsCatagory source,
+        Transform staging, SettingsRow optionsTemplate, SettingsRow? sliderTemplate,
+        NeuralRenderingPage? neural)
+    {
+        GameObject? cloneRoot = null;
+        Page? page = null;
+
+        // Every failure after construction goes through one cleanup path, so a partially built page
+        // never leaves registry entries or listeners pointing at rows the staging root destroys.
+        void CleanupRows()
+        {
+            if (page == null) return;
+            foreach (var binding in page.Bindings)
+            {
+                var row = binding.Row;
+                if (row == null) continue;
+                try
+                {
+                    var rowId = row.GetInstanceID();
+                    if (PanelsByRow.TryGetValue(rowId, out var owner) && owner == panel)
+                        PanelsByRow.Remove(rowId);
+                    UnregisterSlider(binding);
+                    ClearListeners(row.leftButton);
+                    ClearListeners(row.rightButton);
+                    ClearListeners(row.slider);
+                }
+                catch
+                {
+                    // A row already torn down with its staging root has nothing left to unregister.
+                }
+            }
+        }
+
+        (Page? Page, string Failure) Fail(string reason)
+        {
+            CleanupRows();
+            if (cloneRoot != null)
+            {
+                try
+                {
+                    UnityEngine.Object.Destroy(cloneRoot);
+                }
+                catch
+                {
+                    // The staging root may already be tearing the clone down.
+                }
+            }
+            return (null, reason);
+        }
+
+        try
+        {
+            cloneRoot = UnityEngine.Object.Instantiate(source.gameObject, staging);
+            cloneRoot.name = neural?.SettingsObjectName ?? SettingsObjectName;
+            cloneRoot.SetActive(false);
+
+            var catagory = cloneRoot.GetComponent<SettingsCatagory>();
+            if (catagory == null)
+                return Fail("the cloned category lost its SettingsCatagory component");
+            var clonedRows = catagory.rows;
+            if (clonedRows == null || clonedRows.Length == 0 || clonedRows[0] == null)
+                return Fail("the cloned category did not reproduce its rows");
+            var rowParent = clonedRows[0].transform.parent;
+            if (rowParent == null || !rowParent.IsChildOf(cloneRoot.transform))
+                return Fail("the cloned category's rows are not its own children");
+            for (var i = 0; i < clonedRows.Length; i++)
+            {
+                if (clonedRows[i] == null) continue;
+                if (!clonedRows[i].transform.IsChildOf(cloneRoot.transform) ||
+                    clonedRows[i].transform.parent != rowParent)
+                    return Fail("a cloned category row points outside the cloned page");
+                clonedRows[i].gameObject.SetActive(false);
+                UnityEngine.Object.Destroy(clonedRows[i].gameObject);
+            }
+
+            page = new Page
+            {
+                Label = neural?.Label ?? CategoryLabel,
+                ObjectName = neural?.CategoryObjectName ?? CategoryObjectName,
+                Catagory = catagory,
+                RowParent = rowParent,
+                CloneRoot = cloneRoot,
+            };
+
+            if (neural == null)
+            {
+                foreach (var schema in SettingsPanelSchema.Rows)
+                {
+                    var binding = CreateBinding(optionsTemplate, staging, schema.Key, schema.Caption, true,
+                        out var bindFailure);
+                    if (binding == null)
+                        return Fail(bindFailure);
+                    page.Bindings.Add(binding);
+                    page.BindingsByKey[schema.Key] = binding;
+                }
+            }
+            else
+            {
+                var pageDef = neural.Value;
+                var warnedSlider = false;
+                foreach (var schema in pageDef.Rows)
+                {
+                    if (schema.Kind == NeuralRenderingRowKind.Slider && sliderTemplate == null)
+                    {
+                        if (!warnedSlider)
+                        {
+                            warnedSlider = true;
+                            Log.LogWarning(
+                                $"the graphics category has no slider row; {pageDef.Label} sliders are unavailable");
+                        }
+                        continue;
+                    }
+                    var template = schema.Kind == NeuralRenderingRowKind.Slider ? sliderTemplate! : optionsTemplate;
+                    var optionsShape = schema.Kind != NeuralRenderingRowKind.Slider;
+                    var binding = CreateBinding(template, staging, schema.Key, schema.Caption, optionsShape,
+                        out var bindFailure);
+                    if (binding == null)
+                        return Fail(bindFailure);
+                    page.Bindings.Add(binding);
+                    page.BindingsByKey[schema.Key] = binding;
+                    page.NeuralByRow[binding.Row.GetInstanceID()] = schema;
+                }
+            }
+
+            var all = new List<SettingsRow>(page.Bindings.Count);
+            var navigation = new List<SettingsRow>(page.Bindings.Count);
+            foreach (var binding in page.Bindings)
+            {
+                all.Add(binding.Row);
+                if (neural != null && page.NeuralByRow.TryGetValue(binding.Row.GetInstanceID(), out var schema) &&
+                    schema.Kind == NeuralRenderingRowKind.Status)
+                    continue;
+                navigation.Add(binding.Row);
+            }
+            page.All = all.ToArray();
+            page.Navigation = navigation.ToArray();
+
+            foreach (var binding in page.Bindings)
+            {
+                panel.Configure(binding);
+                if (neural == null) continue;
+                if (!page.NeuralByRow.TryGetValue(binding.Row.GetInstanceID(), out var schema)) continue;
+                if (schema.Kind == NeuralRenderingRowKind.Slider)
+                    panel.ConfigureNeuralSlider(binding, schema);
+                else if (schema.Kind == NeuralRenderingRowKind.Status)
+                    panel.ConfigureNeuralStatus(binding);
+            }
+
+            catagory.rows = new Il2CppReferenceArray<SettingsRow>(page.All);
+            return (page, "");
+        }
+        catch (Exception exception)
+        {
+            return Fail("build threw " + exception.GetType().Name + ": " + exception.Message);
         }
     }
 
@@ -513,6 +707,7 @@ internal sealed class SettingsPanel
     private void Configure(RowBinding binding)
     {
         var row = binding.Row;
+        binding.Owner = this;
         row.saveSelf = false;
         row.settingsType = SettingsType.NotSet;
         row.settingsMenu = _menu;
@@ -528,6 +723,72 @@ internal sealed class SettingsPanel
         if (row.rightButton != null)
             row.rightButton.onClick.AddListener(new Action(() => HandleDirection(direction, 1)));
         row.allSelectables = BuildSelectables(row);
+    }
+
+    /// <summary>
+    /// Turns one cloned slider row into a direct configuration editor. The row keeps no arrow
+    /// interaction: the three Neural Rendering values are continuous, so only the Slider remains.
+    /// </summary>
+    private void ConfigureNeuralSlider(RowBinding binding, NeuralRenderingRow schema)
+    {
+        var row = binding.Row;
+        var slider = row.slider;
+        if (slider == null) return;
+
+        BepInEx.Configuration.ConfigEntry<float>? entry = schema.Key switch
+        {
+            NeuralRenderingSchema.StrengthKey => Settings.DLSS5Strength,
+            NeuralRenderingSchema.DetailKey => Settings.DLSS5Detail,
+            NeuralRenderingSchema.ToneKey => Settings.DLSS5Tone,
+            _ => null,
+        };
+        if (entry == null) return;
+
+        if (row.leftButton != null) row.leftButton.gameObject.SetActive(false);
+        if (row.rightButton != null) row.rightButton.gameObject.SetActive(false);
+
+        slider.minValue = schema.Min;
+        slider.maxValue = schema.Max;
+        slider.wholeNumbers = false;
+        ClearListeners(slider);
+        var started = NeuralRenderingModes.ClampUnit(entry.Value);
+        slider.value = started;
+        SetText(binding.Value, started.ToString("F2", CultureInfo.InvariantCulture));
+        binding.SliderEntry = entry;
+        binding.SliderPreview = started;
+        binding.SliderPending = false;
+
+        // UnityAction<T> is an IL2CPP delegate wrapper, not a C# delegate type, so a lambda cannot
+        // convert to it directly. DelegateSupport creates the managed adapter once at build time.
+        var listener = Il2CppInterop.Runtime.DelegateSupport.ConvertDelegate<
+            UnityEngine.Events.UnityAction<float>>(new Action<float>(changed =>
+        {
+            if (_disposed || _refreshing) return;
+            // Dragging only previews the value; the configuration is written when the pointer is
+            // released (or the row is stepped with a keyboard/gamepad, or the page changes).
+            var clamped = NeuralRenderingModes.ClampUnit(changed);
+            binding.SliderPreview = clamped;
+            binding.SliderPending = true;
+            SetText(binding.Value, clamped.ToString("F2", CultureInfo.InvariantCulture));
+        }));
+        slider.onValueChanged.AddListener(listener);
+        SliderBindings[slider.GetInstanceID()] = binding;
+
+        // BuildSelectables has to observe the hidden arrows, not the template state.
+        row.allSelectables = BuildSelectables(row);
+    }
+
+    /// <summary>
+    /// Turns the status row into read-only text: no arrows, no selectables, and it never receives
+    /// vertical navigation because <see cref="Page.Navigation"/> excludes it.
+    /// </summary>
+    private void ConfigureNeuralStatus(RowBinding binding)
+    {
+        var row = binding.Row;
+        if (row.leftButton != null) row.leftButton.gameObject.SetActive(false);
+        if (row.rightButton != null) row.rightButton.gameObject.SetActive(false);
+        SetText(binding.Value, Coordinator?.NeuralRenderingStatusText ?? "Waiting");
+        row.allSelectables = new Il2CppReferenceArray<Selectable>(Array.Empty<Selectable>());
     }
 
     private static Il2CppReferenceArray<Selectable> BuildSelectables(SettingsRow row)
@@ -572,7 +833,7 @@ internal sealed class SettingsPanel
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not remove localisation from a cloned Upscaling control: " + exception.Message);
+            Log.LogWarning("Could not remove localisation from a cloned BigScale settings row: " + exception.Message);
         }
     }
 
@@ -592,7 +853,7 @@ internal sealed class SettingsPanel
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not hide template text on a Upscaling row: " + exception.Message);
+            Log.LogWarning("Could not hide template text on a BigScale settings row: " + exception.Message);
         }
     }
 
@@ -601,55 +862,62 @@ internal sealed class SettingsPanel
 
     private void RebuildSelectables()
     {
-        foreach (var binding in _bindings)
-            binding.Row.allSelectables = BuildSelectables(binding.Row);
+        foreach (var page in _pages)
+            foreach (var binding in page.Bindings)
+                binding.Row.allSelectables = BuildSelectables(binding.Row);
     }
 
     /// <summary>
     /// Rebuilds the vertical ring over the rows a navigation may actually land on. While VR owns the
     /// session the multiplier row is visible but excluded and its arrows are non-interactable: VR frame
     /// generation is fixed at 2x, so the remembered desktop multiplier cannot be reached or changed.
+    /// The lock applies only to the Upscaling page; every other page uses its own full navigation set.
     /// </summary>
     private void RebuildNavigation()
     {
-        var targets = new List<SettingsRow>(_navigation.Length);
-        foreach (var row in _navigation)
+        for (var pageIndex = 0; pageIndex < _pages.Count; pageIndex++)
         {
-            if (_vrLocked && row == _frameMultiplierRow.Row) continue;
-            targets.Add(row);
-        }
-        if (targets.Count == 0) return;
-        for (var i = 0; i < targets.Count; i++)
-        {
-            var previous = targets[(i - 1 + targets.Count) % targets.Count];
-            var next = targets[(i + 1) % targets.Count];
+            var page = _pages[pageIndex];
+            var lockMultiplier = pageIndex == 0 && _vrLocked;
+            var targets = new List<SettingsRow>(page.Navigation.Length);
+            foreach (var row in page.Navigation)
+            {
+                if (lockMultiplier && row == _frameMultiplierRow.Row) continue;
+                targets.Add(row);
+            }
+            if (targets.Count == 0) continue;
+            for (var i = 0; i < targets.Count; i++)
+            {
+                var previous = targets[(i - 1 + targets.Count) % targets.Count];
+                var next = targets[(i + 1) % targets.Count];
+                try
+                {
+                    targets[i].SetNavigation(previous, next);
+                }
+                catch (Exception exception)
+                {
+                    Log.LogWarning("Could not rebuild BigScale settings row navigation: " + exception.Message);
+                }
+            }
+            if (!lockMultiplier) continue;
+            // An excluded row is never reachable from another row; point it at itself so a stale
+            // selection cannot walk back into the locked control.
             try
             {
-                targets[i].SetNavigation(previous, next);
+                _frameMultiplierRow.Row.SetNavigation(_frameMultiplierRow.Row, _frameMultiplierRow.Row);
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not rebuild Upscaling row navigation: " + exception.Message);
+                Log.LogWarning("Could not lock the BigScale frame-generation navigation: " + exception.Message);
             }
-        }
-        if (!_vrLocked) return;
-        // An excluded row is never reachable from another row; point it at itself so a stale
-        // selection cannot walk back into the locked control.
-        try
-        {
-            _frameMultiplierRow.Row.SetNavigation(_frameMultiplierRow.Row, _frameMultiplierRow.Row);
-        }
-        catch (Exception exception)
-        {
-            Log.LogWarning("Could not lock the Upscaling frame-generation navigation: " + exception.Message);
         }
     }
 
     /// <summary>
     /// Owns the category column: snapshots the stock tabs, validates the whole placement, disables
-    /// the captured layout groups only after that, and adds the Upscaling tab immediately after Graphics.
-    /// The stock tabs keep their native parents; the nearest native RectTransform that contains them
-    /// all is used only as the measurement and placement coordinate system.
+    /// the captured layout groups only after that, and inserts every owned page tab immediately after
+    /// Graphics in page order. The stock tabs keep their native parents; the nearest native RectTransform
+    /// that contains them all is used only as the measurement and placement coordinate system.
     /// </summary>
     private bool TryOwnCategoryColumn(SettingsCatagory source, Transform staging, out string failure)
     {
@@ -779,8 +1047,7 @@ internal sealed class SettingsPanel
                 if (!known.Add(button.GetInstanceID())) continue;
                 var rect = RectOf(button.transform);
                 if (rect == null) continue;
-                if (rect.gameObject.name == CategoryObjectName) continue;
-                if (_categoryButtonPointer != IntPtr.Zero && button.Pointer == _categoryButtonPointer) continue;
+                if (rect.gameObject.name.StartsWith("BigScale.", StringComparison.Ordinal)) continue;
                 if (!Contains(common, rect.transform)) continue;
                 if (!TryMeasureTab(rect, common, out var extraMeasurement, out _)) continue;
                 if (!Overlaps(extraMeasurement.MinX, extraMeasurement.MaxX,
@@ -848,13 +1115,110 @@ internal sealed class SettingsPanel
             return false;
         }
 
-        // Prevalidate every slot, including the proposed Upscaling tab, before any stock geometry changes.
-        var finalCount = collected.Count + 1;
+        // Prevalidate every slot, including every proposed page tab, before any stock geometry changes.
+        // If the full set does not fit, drop pages from the last one backwards and keep Upscaling.
+        var injected = _pages.Count;
+        var slotsValid = ValidateCategorySlots(injected, graphicsIndex, order, measured, graphicsMeasurement,
+            boundsTop, boundsBottom, collected, out var slotFailure);
+        while (!slotsValid && injected > 1)
+        {
+            var dropped = _pages[_pages.Count - 1];
+            _pages.RemoveAt(_pages.Count - 1);
+            DiscardPage(dropped);
+            injected = _pages.Count;
+            Log.LogWarning("the category column cannot hold the " + dropped.Label + " page");
+            slotsValid = ValidateCategorySlots(injected, graphicsIndex, order, measured, graphicsMeasurement,
+                boundsTop, boundsBottom, collected, out slotFailure);
+        }
+        if (!slotsValid)
+        {
+            failure = slotFailure;
+            return false;
+        }
+
+        _categoryParent = common;
+        _categoryOrder.Clear();
+        foreach (var index in order)
+            _categoryOrder.Add(Capture(collected[index].Label, collected[index].Rect, collected[index].Tab));
+        _graphicsSnapshot = _categoryOrder.Find(snapshot => SameNative(snapshot.Selectable, sourceButton));
+        if (_graphicsSnapshot == null)
+        {
+            failure = "the Graphics category tab could not be identified in the column";
+            return false;
+        }
+        _categoryLayoutOwned = true;
+        DisableOwnedLayoutGroups();
+
+        for (var i = 0; i < _pages.Count; i++)
+        {
+            var page = _pages[i];
+            var previous = i == 0 ? sourceButton : _pages[i - 1].ButtonSelectable;
+            if (previous == null)
+            {
+                failure = "the previous category tab is missing";
+                ReleaseCategoryColumn(false);
+                return false;
+            }
+            if (CreateCategoryButton(page, previous, graphicsParentRect, staging, out var tabFailure)) continue;
+            failure = tabFailure;
+            if (i == 0)
+            {
+                ReleaseCategoryColumn(false);
+                return false;
+            }
+            // A tab that could not be created must not take the Upscaling page, or a later page,
+            // down with it: drop this page and retry the same index with the next one.
+            _pages.RemoveAt(i);
+            DiscardPage(page);
+            Log.LogWarning("Could not create the " + page.Label + " category tab: " + failure);
+            i--;
+        }
+        if (!ApplyCategoryLayout())
+        {
+            failure = "the BigScale category tab could not be placed in the stock column: " + _categoryLayoutFailure;
+            ReleaseCategoryColumn(true);
+            return false;
+        }
+        foreach (var page in _pages)
+            if (page.CategoryButton != null) page.CategoryButton.SetActive(true);
+        return true;
+    }
+
+    /// <summary>
+    /// Validates the complete stock-plus-injected slot table without touching any transform. Slots at
+    /// or before Graphics keep their stock tab, the injected pages take the slots immediately after
+    /// Graphics using the Graphics measurement, and later stock tabs shift by the injected count.
+    /// </summary>
+    private bool ValidateCategorySlots(int injected, int graphicsIndex, List<int> order,
+        TabMeasurement[] measured, TabMeasurement graphicsMeasurement, float boundsTop, float boundsBottom,
+        List<(string Label, Selectable Tab, RectTransform Rect)> collected, out string failure)
+    {
+        failure = "";
+        var finalCount = collected.Count + injected;
         for (var slot = 0; slot < finalCount; slot++)
         {
-            var sourceIndex = slot <= graphicsIndex ? order[slot] : order[slot - 1];
-            var measurement = measured[sourceIndex];
-            var label = slot == graphicsIndex + 1 ? CategoryLabel : collected[sourceIndex].Label;
+            int sourceIndex;
+            string label;
+            TabMeasurement measurement;
+            if (slot <= graphicsIndex)
+            {
+                sourceIndex = order[slot];
+                label = collected[sourceIndex].Label;
+                measurement = measured[sourceIndex];
+            }
+            else if (slot <= graphicsIndex + injected)
+            {
+                var pageIndex = slot - graphicsIndex - 1;
+                sourceIndex = order[graphicsIndex];
+                label = _pages[pageIndex].Label;
+                measurement = graphicsMeasurement;
+            }
+            else
+            {
+                sourceIndex = order[slot - injected];
+                label = collected[sourceIndex].Label;
+                measurement = measured[sourceIndex];
+            }
             if (!CategoryColumnLayout.TryGetSlot(boundsTop, boundsBottom,
                     measurement.Top - measurement.Bottom, finalCount, slot, out var center, out var height))
             {
@@ -873,32 +1237,6 @@ internal sealed class SettingsPanel
                 return false;
             }
         }
-
-        _categoryParent = common;
-        _categoryOrder.Clear();
-        foreach (var index in order)
-            _categoryOrder.Add(Capture(collected[index].Label, collected[index].Rect, collected[index].Tab));
-        _graphicsSnapshot = _categoryOrder.Find(snapshot => SameNative(snapshot.Selectable, sourceButton));
-        if (_graphicsSnapshot == null)
-        {
-            failure = "the Graphics category tab could not be identified in the column";
-            return false;
-        }
-        _categoryLayoutOwned = true;
-        DisableOwnedLayoutGroups();
-
-        if (!CreateCategoryButton(sourceButton, graphicsParentRect, staging, out failure))
-        {
-            ReleaseCategoryColumn(false);
-            return false;
-        }
-        if (!ApplyCategoryLayout())
-        {
-            failure = "the Upscaling category tab could not be placed in the stock column: " + _categoryLayoutFailure;
-            ReleaseCategoryColumn(true);
-            return false;
-        }
-        if (_categoryButton != null) _categoryButton.SetActive(true);
         return true;
     }
 
@@ -1125,7 +1463,7 @@ internal sealed class SettingsPanel
         }
     }
 
-    private bool CreateCategoryButton(Selectable source, RectTransform parent, Transform staging,
+    private bool CreateCategoryButton(Page page, Selectable source, RectTransform parent, Transform staging,
         out string failure)
     {
         failure = "";
@@ -1133,7 +1471,7 @@ internal sealed class SettingsPanel
         try
         {
             clone = UnityEngine.Object.Instantiate(source.gameObject, staging);
-            clone.name = CategoryObjectName;
+            clone.name = page.ObjectName;
             clone.SetActive(false);
             var selectable = clone.GetComponent<Selectable>();
             var button = clone.GetComponent<Button>();
@@ -1146,7 +1484,7 @@ internal sealed class SettingsPanel
 
             StripLocalisation(clone);
             ClearListeners(button);
-            button.onClick.AddListener(new Action(Show));
+            button.onClick.AddListener(new Action(() => Show(page)));
             var labels = clone.GetComponentsInChildren<TMP_Text>(true);
             if (labels.Length == 0)
             {
@@ -1156,7 +1494,7 @@ internal sealed class SettingsPanel
             }
             foreach (var text in labels)
             {
-                SetText(text, CategoryLabel);
+                SetText(text, page.Label);
                 // The stock template may force upper-case/small-caps; the canonical name is mixed
                 // case and must render exactly.
                 text.fontStyle &= ~(FontStyles.UpperCase | FontStyles.SmallCaps);
@@ -1194,29 +1532,31 @@ internal sealed class SettingsPanel
             }
             if (listIndex < 0)
             {
-                failure = "the Graphics category tab is not in the game's button list (" +
-                          DescribeTab(source) + ")";
+                failure = (page.ObjectName == CategoryObjectName ? "the Graphics" : "the previous") +
+                          " category tab is not in the game's button list (" + DescribeTab(source) + ")";
                 UnityEngine.Object.Destroy(clone);
                 return false;
             }
             // Cache the clone's Button component pointer before it joins the list; removal uses the
             // same identity even after the Unity object is destroyed.
-            _categoryButtonPointer = button.Pointer;
+            page.ButtonPointer = button.Pointer;
             list.Insert(Mathf.Clamp(listIndex + 1, 0, list.Count), button);
             clone.transform.SetSiblingIndex(Mathf.Min(source.transform.GetSiblingIndex() + 1,
                 parent.childCount - 1));
 
-            _categoryButton = clone;
-            _categoryButtonSnapshot = Capture(CategoryLabel, cloneRect, selectable);
-            _catagory.catagoryButton = selectable;
+            page.CategoryButton = clone;
+            page.ButtonSelectable = selectable;
+            page.ButtonSnapshot = Capture(page.Label, cloneRect, selectable);
+            page.Catagory.catagoryButton = selectable;
             return true;
         }
         catch (Exception exception)
         {
-            RemoveOwnedCategoryButtonEntry();
+            RemoveButtonEntry(page);
             if (clone != null) UnityEngine.Object.Destroy(clone);
-            _categoryButton = null;
-            _categoryButtonSnapshot = null;
+            page.CategoryButton = null;
+            page.ButtonSelectable = null;
+            page.ButtonSnapshot = null;
             failure = "the category tab could not be created: " + exception.GetType().Name + ": " +
                       exception.Message;
             return false;
@@ -1259,21 +1599,24 @@ internal sealed class SettingsPanel
     {
         _categoryLayoutFailure = "";
         if (_disposed || !_categoryLayoutOwned || _categoryParent == null) return false;
-        if (_categoryButtonSnapshot == null || _categoryButtonSnapshot.Rect == null)
+        foreach (var page in _pages)
         {
-            FailLayout(new List<CategorySnapshot>(), "the Upscaling category tab is missing");
+            if (page.ButtonSnapshot != null && page.ButtonSnapshot.Rect != null) continue;
+            FailLayout(new List<CategorySnapshot>(), "the " + page.Label + " category tab is missing");
             return false;
         }
 
-        var checkpoint = new List<CategorySnapshot>(_categoryOrder.Count + 1);
+        var checkpoint = new List<CategorySnapshot>(_categoryOrder.Count + _pages.Count);
         try
         {
             foreach (var snapshot in _categoryOrder)
                 if (snapshot.Rect != null) checkpoint.Add(Capture(snapshot.Label, snapshot.Rect, snapshot.Selectable));
-            checkpoint.Add(Capture(CategoryLabel, _categoryButtonSnapshot.Rect, _categoryButtonSnapshot.Selectable));
+            foreach (var page in _pages)
+                if (page.ButtonSnapshot != null)
+                    checkpoint.Add(Capture(page.Label, page.ButtonSnapshot.Rect, page.ButtonSnapshot.Selectable));
 
             foreach (var snapshot in _categoryOrder) Restore(snapshot);
-            Restore(_categoryButtonSnapshot);
+            foreach (var page in _pages) Restore(page.ButtonSnapshot);
             DisableOwnedLayoutGroups();
 
             var survivors = new List<CategorySnapshot>(_categoryOrder.Count);
@@ -1286,11 +1629,13 @@ internal sealed class SettingsPanel
             if (graphicsIndex < 0)
                 return FailLayout(checkpoint, "the Graphics category tab disappeared");
 
-            var ordered = new List<CategorySnapshot>(survivors.Count + 1);
+            var ordered = new List<CategorySnapshot>(survivors.Count + _pages.Count);
             for (var i = 0; i < survivors.Count; i++)
             {
                 ordered.Add(survivors[i]);
-                if (i == graphicsIndex) ordered.Add(_categoryButtonSnapshot);
+                if (i != graphicsIndex) continue;
+                foreach (var page in _pages)
+                    if (page.ButtonSnapshot != null) ordered.Add(page.ButtonSnapshot);
             }
 
             var count = ordered.Count;
@@ -1376,12 +1721,12 @@ internal sealed class SettingsPanel
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not restore the previous Upscaling category layout: " + exception.Message);
+            Log.LogWarning("Could not restore the previous BigScale settings panel category layout: " + exception.Message);
         }
         if (!_categoryLayoutFailureLogged)
         {
             _categoryLayoutFailureLogged = true;
-            Log.LogWarning("Could not place the Upscaling category tab: " + reason +
+            Log.LogWarning("Could not place the BigScale category tab: " + reason +
                            "; the previous category layout is kept.");
         }
         return false;
@@ -1396,7 +1741,7 @@ internal sealed class SettingsPanel
         if (_categoryParent != null)
         {
             foreach (var snapshot in _categoryOrder) Restore(snapshot);
-            Restore(_categoryButtonSnapshot);
+            foreach (var page in _pages) Restore(page.ButtonSnapshot);
             RestoreOwnedLayoutGroups();
         }
 
@@ -1404,7 +1749,7 @@ internal sealed class SettingsPanel
         _layoutGroups.Clear();
         _categoryParent = null;
         _graphicsSnapshot = null;
-        _categoryButtonSnapshot = null;
+        foreach (var page in _pages) page.ButtonSnapshot = null;
         _categoryLayoutOwned = false;
         _categoryLayoutFailureLogged = false;
         _categoryLayoutFailure = "";
@@ -1414,27 +1759,34 @@ internal sealed class SettingsPanel
 
         if (!destroyButton) return;
 
-        // Remove the owned entry before destroying the object; the cached Button component pointer is
-        // the only identity that still matches after the Unity object becomes destroyed.
+        // Remove the owned entries before destroying the objects; the cached Button component
+        // pointer is the only identity that still matches after a Unity object becomes destroyed.
         RemoveOwnedCategoryButtonEntry();
-        if (_categoryButton != null)
+        foreach (var page in _pages)
         {
+            if (page.CategoryButton == null) continue;
             try
             {
-                UnityEngine.Object.Destroy(_categoryButton);
+                UnityEngine.Object.Destroy(page.CategoryButton);
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not destroy the Upscaling category tab: " + exception.Message);
+                Log.LogWarning("Could not destroy the " + page.Label + " category tab: " + exception.Message);
             }
+            page.CategoryButton = null;
+            page.ButtonSelectable = null;
         }
-        _categoryButton = null;
     }
 
     private void RemoveOwnedCategoryButtonEntry()
     {
-        var pointer = _categoryButtonPointer;
-        _categoryButtonPointer = IntPtr.Zero;
+        foreach (var page in _pages) RemoveButtonEntry(page);
+    }
+
+    private void RemoveButtonEntry(Page page)
+    {
+        var pointer = page.ButtonPointer;
+        page.ButtonPointer = IntPtr.Zero;
         if (pointer == IntPtr.Zero) return;
         try
         {
@@ -1458,8 +1810,55 @@ internal sealed class SettingsPanel
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not remove the Upscaling category tab from the button list: " + exception.Message);
+            Log.LogWarning("Could not remove a BigScale category tab from the button list: " + exception.Message);
         }
+    }
+
+    /// <summary>
+    /// Drops one page after it failed to earn its tab or slot. Its rows leave the panel registry and
+    /// its clone is destroyed; the remaining pages keep their exact state.
+    /// </summary>
+    private void DiscardPage(Page page)
+    {
+        RemoveButtonEntry(page);
+        foreach (var binding in page.Bindings)
+        {
+            var row = binding.Row;
+            if (row == null) continue;
+            var rowId = row.GetInstanceID();
+            if (PanelsByRow.TryGetValue(rowId, out var owner) && owner == this) PanelsByRow.Remove(rowId);
+            UnregisterSlider(binding);
+            ClearListeners(row.leftButton);
+            ClearListeners(row.rightButton);
+            ClearListeners(row.slider);
+        }
+        if (page.CategoryButton != null)
+        {
+            try
+            {
+                UnityEngine.Object.Destroy(page.CategoryButton);
+            }
+            catch
+            {
+                // The category column may already be tearing the clone down.
+            }
+            page.CategoryButton = null;
+        }
+        page.ButtonSelectable = null;
+        page.ButtonSnapshot = null;
+        if (page.CloneRoot != null)
+        {
+            try
+            {
+                UnityEngine.Object.Destroy(page.CloneRoot);
+            }
+            catch
+            {
+                // The staging root may already be destroyed with the whole build.
+            }
+            page.CloneRoot = null;
+        }
+        page.Catagory = null!;
     }
 
     private void DisableOwnedLayoutGroups()
@@ -1527,35 +1926,55 @@ internal sealed class SettingsPanel
 
     private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
 
-    /// <summary>Shows this category through the game's own category swap.</summary>
-    internal void Show()
+    /// <summary>Shows the Upscaling category through the game's own category swap.</summary>
+    internal void Show() => Show(_pages[0]);
+
+    /// <summary>Shows one page and hides every other page this panel owns.</summary>
+    private void Show(Page page)
     {
-        if (_disposed) return;
+        if (_disposed || page == null) return;
+        FlushPendingSliders();
+        var events = UnityEngine.EventSystems.EventSystem.current;
+        var opener = events != null ? events.currentSelectedGameObject : null;
+        var keepOpener = opener != null && opener == page.CategoryButton;
         ApplyCategoryLayout();
         try
         {
-            _menu.SwapToCatagory(_catagory);
+            _menu.SwapToCatagory(page.Catagory);
         }
         catch (Exception exception)
         {
             Log.LogWarning("SwapToCatagory failed, falling back to NavigateToCatagory: " + exception.Message);
             try
             {
-                _menu.NavigateToCatagory(_catagory);
+                _menu.NavigateToCatagory(page.Catagory);
             }
             catch (Exception inner)
             {
-                Log.LogError("Could not open the Upscaling category: " + inner.Message);
+                Log.LogError("Could not open the " + page.Label + " category: " + inner.Message);
                 return;
+            }
+        }
+
+        foreach (var candidate in _pages)
+        {
+            if (candidate == page) continue;
+            try
+            {
+                if (candidate.Catagory != null) candidate.Catagory.gameObject.SetActive(false);
+            }
+            catch (Exception exception)
+            {
+                Log.LogWarning("Could not hide an inactive " + candidate.Label + " page: " + exception.Message);
             }
         }
         try
         {
-            _catagory.gameObject.SetActive(true);
+            page.Catagory.gameObject.SetActive(true);
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not activate the Upscaling category page: " + exception.Message);
+            Log.LogWarning("Could not activate the " + page.Label + " category page: " + exception.Message);
             return;
         }
 
@@ -1563,20 +1982,19 @@ internal sealed class SettingsPanel
         ApplyCategoryLayout();
         // SettingsCatagory.Start runs on this first activation; reassert the page's own rows and tab
         // so a stock field write cannot replace them.
-        _catagory.rows = new Il2CppReferenceArray<SettingsRow>(_all);
-        if (_categoryButton != null)
+        page.Catagory.rows = new Il2CppReferenceArray<SettingsRow>(page.All);
+        if (page.ButtonSelectable != null)
         {
-            var selectable = _categoryButton.GetComponent<Selectable>();
-            if (selectable != null) _catagory.catagoryButton = selectable;
+            page.Catagory.catagoryButton = page.ButtonSelectable;
             EnsureCategoryButtonListed();
         }
 
         // The page's own OnEnable has now run. Remove localisation so it cannot restore template text,
         // then write the bound literals synchronously before the first rendered frame.
-        if (!_localisationStripped)
+        if (!page.LocalisationStripped)
         {
-            _localisationStripped = true;
-            foreach (var binding in _bindings)
+            page.LocalisationStripped = true;
+            foreach (var binding in page.Bindings)
             {
                 StripLocalisation(binding.Row.gameObject);
                 HideUnusedTemplateText(binding);
@@ -1584,73 +2002,34 @@ internal sealed class SettingsPanel
         }
         RebuildSelectables();
         RebuildNavigation();
-        FocusFirstRow();
+        // A category click leaves its tab selected, exactly like a stock category. If the stock swap
+        // moved the EventSystem selection into the page, put it back on the tab that opened the page.
+        if (keepOpener && events != null && opener != null && opener.activeInHierarchy &&
+            events.currentSelectedGameObject != opener)
+            events.SetSelectedGameObject(opener);
         // The row must say "suspended for settings" immediately, not after the bounded refresh.
         Coordinator?.RefreshFrameGenerationStatus(true);
         Refresh();
     }
 
-    /// <summary>Hides the page without disposing anything, for an ordinary settings close.</summary>
+    /// <summary>Hides every page without disposing anything, for an ordinary settings close.</summary>
     internal void Hide()
     {
         if (_disposed) return;
-        try
-        {
-            if (_catagory != null) _catagory.gameObject.SetActive(false);
-        }
-        catch (Exception exception)
-        {
-            Log.LogWarning("Could not hide the Upscaling category: " + exception.Message);
-        }
-        Coordinator?.RefreshFrameGenerationStatus(false);
-        Refresh();
-    }
-
-    /// <summary>Returns to a previously active category, or leaves this page hidden.</summary>
-    internal void RestoreCategory(SettingsCatagory? previous)
-    {
-        if (_disposed) return;
-        if (previous != null && previous != _catagory && previous.gameObject != null)
+        FlushPendingSliders();
+        foreach (var page in _pages)
         {
             try
             {
-                _menu.SwapToCatagory(previous);
-                return;
+                if (page.Catagory != null) page.Catagory.gameObject.SetActive(false);
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not restore the previous category: " + exception.Message);
+                Log.LogWarning("Could not hide the " + page.Label + " category: " + exception.Message);
             }
         }
-        Hide();
-    }
-
-    private void FocusFirstRow()
-    {
-        try
-        {
-            var events = UnityEngine.EventSystems.EventSystem.current;
-            if (events == null) return;
-            foreach (var row in _navigation)
-            {
-                if (row == null) continue;
-                var first = row.firstSelectable;
-                if (first == null)
-                {
-                    var selectables = row.allSelectables;
-                    if (selectables != null && selectables.Length > 0) first = selectables[0];
-                }
-                if (first == null) continue;
-                if (!first.gameObject.activeInHierarchy || !first.IsInteractable()) continue;
-                if (!BelongsTo(row, first.transform)) continue;
-                events.SetSelectedGameObject(first.gameObject);
-                return;
-            }
-        }
-        catch (Exception exception)
-        {
-            Log.LogWarning("Could not focus the first Upscaling row: " + exception.Message);
-        }
+        Coordinator?.RefreshFrameGenerationStatus(false);
+        Refresh();
     }
 
     /// <summary>Re-reads the configuration into the cloned controls at a bounded rate.</summary>
@@ -1669,29 +2048,132 @@ internal sealed class SettingsPanel
         {
             var vr = VrState.Active;
             UpdateControlAvailability(vr);
-            foreach (var binding in _bindings) SetText(binding.Caption, binding.CaptionText);
+            foreach (var page in _pages)
+            {
+                foreach (var binding in page.Bindings) SetText(binding.Caption, binding.CaptionText);
+                if (page != Primary)
+                {
+                    RefreshNeuralPage(page);
+                    continue;
+                }
 
-            SetText(_enabledRow.Value, Settings.Enabled.Value ? "On" : "Off");
-            var upscaler = UpscalingModes.Name(Settings.Upscaler.Value);
-            SetText(_upscalerRow.Value, upscaler);
-            SetText(_modeRow.Value, UpscalingModes.Name(Settings.Preset.Value, Settings.Upscaler.Value));
-            // VR has its own provider selection: the desktop choice stays remembered but is never what
-            // this row shows or changes while a VR session owns the process.
-            SetText(_frameGenerationRow.Value,
-                vr ? UpscalingModes.Name(Settings.VrFrameGeneration.Value)
-                   : UpscalingModes.Name(Settings.FrameGeneration.Value));
-            SetText(_frameMultiplierRow.Value, FrameMultiplierLabel(vr));
-            // The generic caption pass above must never win over the typed restart requirement.
-            SetText(_frameGenerationRow.Caption, FrameGenerationCaption(vr));
+                SetText(_enabledRow.Value, Settings.Enabled.Value ? "On" : "Off");
+                var upscaler = UpscalingModes.Name(Settings.Upscaler.Value);
+                SetText(_upscalerRow.Value, upscaler);
+                SetText(_modeRow.Value, UpscalingModes.Name(Settings.Preset.Value, Settings.Upscaler.Value));
+                // VR has its own provider selection: the desktop choice stays remembered but is never what
+                // this row shows or changes while a VR session owns the process.
+                SetText(_frameGenerationRow.Value,
+                    vr ? UpscalingModes.Name(Settings.VrFrameGeneration.Value)
+                       : UpscalingModes.Name(Settings.FrameGeneration.Value));
+                SetText(_frameMultiplierRow.Value, FrameMultiplierLabel(vr));
+                // The generic caption pass above must never win over the typed restart requirement.
+                SetText(_frameGenerationRow.Caption, FrameGenerationCaption(vr));
+            }
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not refresh the Upscaling panel: " + exception.Message);
+            Log.LogWarning("Could not refresh the BigScale settings panel: " + exception.Message);
         }
         finally
         {
             _refreshing = false;
         }
+    }
+
+    private void RefreshNeuralPage(Page page)
+    {
+        foreach (var binding in page.Bindings)
+        {
+            if (!page.NeuralByRow.TryGetValue(binding.Row.GetInstanceID(), out var row)) continue;
+            switch (row.Key)
+            {
+                case NeuralRenderingSchema.EnabledKey:
+                    SetText(binding.Value, Settings.DLSS5MasterEnabled.Value ? "On" : "Off");
+                    break;
+                case NeuralRenderingSchema.PresetKey:
+                    SetText(binding.Value, NeuralRenderingModes.Name(Settings.DLSS5Preset.Value));
+                    break;
+                case NeuralRenderingSchema.TimingKey:
+                    SetText(binding.Value, NeuralRenderingModes.Name(Settings.DLSS5Timing.Value));
+                    break;
+                case NeuralRenderingSchema.StrengthKey:
+                    RefreshNeuralSlider(binding, Settings.DLSS5Strength.Value);
+                    break;
+                case NeuralRenderingSchema.DetailKey:
+                    RefreshNeuralSlider(binding, Settings.DLSS5Detail.Value);
+                    break;
+                case NeuralRenderingSchema.ToneKey:
+                    RefreshNeuralSlider(binding, Settings.DLSS5Tone.Value);
+                    break;
+                case NeuralRenderingSchema.PassesKey:
+                    SetText(binding.Value, Settings.DLSS5Passes.Value.ToString());
+                    break;
+                case NeuralRenderingSchema.CharacterMaskKey:
+                    SetText(binding.Value, Settings.DLSS5CharacterMask.Value ? "On" : "Off");
+                    break;
+                case NeuralRenderingSchema.StatusKey:
+                    SetText(binding.Value, Coordinator?.NeuralRenderingStatusText ?? "Waiting");
+                    break;
+            }
+        }
+    }
+
+    private static void RefreshNeuralSlider(RowBinding binding, float value)
+    {
+        if (binding.SliderPending)
+        {
+            SetText(binding.Value, binding.SliderPreview.ToString("F2", CultureInfo.InvariantCulture));
+            return;
+        }
+        var clamped = NeuralRenderingModes.ClampUnit(value);
+        binding.SliderPreview = clamped;
+        if (binding.Row.slider != null) binding.Row.slider.SetValueWithoutNotify(clamped);
+        SetText(binding.Value, clamped.ToString("F2", CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>Writes one previewed slider value to its configuration entry, once.</summary>
+    private void CommitNeuralSlider(RowBinding binding)
+    {
+        if (binding == null || !binding.SliderPending) return;
+        binding.SliderPending = false;
+        var entry = binding.SliderEntry;
+        if (entry == null) return;
+        var value = NeuralRenderingModes.ClampUnit(binding.SliderPreview);
+        binding.SliderPreview = value;
+        if (entry.Value == value) return;
+        entry.Value = value;
+        Log.LogInfo("panel: " + binding.CaptionText + "=" +
+                    value.ToString("F2", CultureInfo.InvariantCulture) + ".");
+    }
+
+    /// <summary>Commits every previewed slider value before the page changes or the menu hides.</summary>
+    private void FlushPendingSliders()
+    {
+        foreach (var page in _pages)
+        {
+            foreach (var binding in page.Bindings)
+            {
+                try
+                {
+                    CommitNeuralSlider(binding);
+                }
+                catch (Exception exception)
+                {
+                    Log.LogWarning("Could not commit a Neural Rendering slider: " + exception.Message);
+                }
+            }
+        }
+    }
+
+    /// <summary>Removes a destroyed slider row from the UI-release registry.</summary>
+    private static void UnregisterSlider(RowBinding binding)
+    {
+        var slider = binding.Row?.slider;
+        if (slider == null) return;
+        var id = slider.GetInstanceID();
+        if (SliderBindings.TryGetValue(id, out var registered) && registered == binding)
+            SliderBindings.Remove(id);
     }
 
     /// <summary>
@@ -1718,7 +2200,8 @@ internal sealed class SettingsPanel
     /// <summary>
     /// Options the arrows may offer: the provider's proven maximum once it has run this session,
     /// and 2x until then. A provider that cannot be asked yet is never offered a total it may not
-    /// produce, so FSR and a cold XeSS both stop at 2x. FSR legitimately has only 2x.
+    /// produce, so FSR and a cold XeSS both stop at 2x. FSR legitimately has only 2x, and ANR is
+    /// capped at 2x because its current release generates one intermediate frame.
     /// </summary>
     private int FrameMultiplierCeiling(FrameGenerationKind provider) =>
         UpscalingModes.FrameMultiplierCeiling(
@@ -1772,6 +2255,71 @@ internal sealed class SettingsPanel
         else if (row == _modeRow.Row) StepMode(direction);
         else if (row == _frameGenerationRow.Row) StepFrameGeneration(direction);
         else if (row == _frameMultiplierRow.Row) StepFrameMultiplier(direction);
+        else
+        {
+            foreach (var page in _pages)
+            {
+                if (!page.NeuralByRow.TryGetValue(row.GetInstanceID(), out var schema)) continue;
+                HandleNeuralDirection(schema, direction);
+                return;
+            }
+        }
+    }
+
+    private void HandleNeuralDirection(NeuralRenderingRow schema, int direction)
+    {
+        switch (schema.Key)
+        {
+            case NeuralRenderingSchema.EnabledKey:
+                Toggle(Settings.DLSS5MasterEnabled, "Enabled");
+                break;
+            case NeuralRenderingSchema.PresetKey:
+                StepNeuralPreset(direction);
+                break;
+            case NeuralRenderingSchema.TimingKey:
+                StepNeuralTiming(direction);
+                break;
+            case NeuralRenderingSchema.PassesKey:
+                StepNeuralPasses(direction);
+                break;
+            case NeuralRenderingSchema.CharacterMaskKey:
+                Toggle(Settings.DLSS5CharacterMask, "CharacterMask");
+                break;
+            // Slider rows are edited through their Slider; the status row is read-only.
+        }
+    }
+
+    private void StepNeuralPreset(int direction)
+    {
+        var order = NeuralRenderingModes.StyleOrder;
+        var index = Array.IndexOf(order, Settings.DLSS5Preset.Value);
+        if (index < 0) index = 0;
+        index = (index + direction + order.Length) % order.Length;
+        Settings.DLSS5Preset.Value = order[index];
+        Log.LogInfo($"panel: Preset={NeuralRenderingModes.Name(order[index])}.");
+        Refresh();
+    }
+
+    private void StepNeuralTiming(int direction)
+    {
+        var order = NeuralRenderingModes.TimingOrder;
+        var index = Array.IndexOf(order, Settings.DLSS5Timing.Value);
+        if (index < 0) index = 0;
+        index = (index + direction + order.Length) % order.Length;
+        Settings.DLSS5Timing.Value = order[index];
+        Log.LogInfo($"panel: Timing={NeuralRenderingModes.Name(order[index])}.");
+        Refresh();
+    }
+
+    private void StepNeuralPasses(int direction)
+    {
+        var current = NeuralRenderingModes.ClampPasses(Settings.DLSS5Passes.Value);
+        var next = current + direction;
+        if (next > NeuralRenderingModes.MaxPasses) next = NeuralRenderingModes.MinPasses;
+        else if (next < NeuralRenderingModes.MinPasses) next = NeuralRenderingModes.MaxPasses;
+        Settings.DLSS5Passes.Value = next;
+        Log.LogInfo($"panel: Passes={next}.");
+        Refresh();
     }
 
     private void Toggle(BepInEx.Configuration.ConfigEntry<bool> entry, string name)
@@ -1857,12 +2405,13 @@ internal sealed class SettingsPanel
     /// <summary>True when this row belongs to this exact panel instance.</summary>
     private bool Owns(SettingsRow row)
     {
-        foreach (var candidate in _all)
-            if (candidate == row) return true;
+        foreach (var page in _pages)
+            foreach (var candidate in page.All)
+                if (candidate == row) return true;
         return false;
     }
 
-    /// <summary>True when this row belongs to a Upscaling panel instance.</summary>
+    /// <summary>True when this row belongs to a BigScale settings panel instance.</summary>
     internal static bool TryHandle(SettingsRow row, out SettingsPanel panel)
     {
         panel = null!;
@@ -1877,25 +2426,33 @@ internal sealed class SettingsPanel
     internal void Dispose()
     {
         if (_disposed) return;
+        // A pending slider must reach the configuration before the row destruction can deselect it.
+        FlushPendingSliders();
         _disposed = true;
         try
         {
             ReleaseCategoryColumn(true);
-            foreach (var row in _all)
+            foreach (var page in _pages)
             {
-                if (row == null) continue;
-                var rowId = row.GetInstanceID();
-                if (PanelsByRow.TryGetValue(rowId, out var owner) && owner == this) PanelsByRow.Remove(rowId);
-                ClearListeners(row.leftButton);
-                ClearListeners(row.rightButton);
-                ClearListeners(row.slider);
+                foreach (var binding in page.Bindings)
+                {
+                    var row = binding.Row;
+                    if (row == null) continue;
+                    var rowId = row.GetInstanceID();
+                    if (PanelsByRow.TryGetValue(rowId, out var owner) && owner == this)
+                        PanelsByRow.Remove(rowId);
+                    UnregisterSlider(binding);
+                    ClearListeners(row.leftButton);
+                    ClearListeners(row.rightButton);
+                    ClearListeners(row.slider);
+                }
+                if (page.Catagory != null) UnityEngine.Object.Destroy(page.Catagory.gameObject);
+                if (page.CloneRoot != null) UnityEngine.Object.Destroy(page.CloneRoot);
             }
-            if (_catagory != null) UnityEngine.Object.Destroy(_catagory.gameObject);
-            if (_cloneRoot != null) UnityEngine.Object.Destroy(_cloneRoot);
         }
         catch (Exception exception)
         {
-            Log.LogWarning("Could not fully dispose the Upscaling panel: " + exception.Message);
+            Log.LogWarning("Could not fully dispose the BigScale settings panel: " + exception.Message);
         }
         if (_menu != null)
         {
@@ -1929,6 +2486,7 @@ internal sealed class SettingsPanel
         foreach (var panel in panels) panel?.Dispose();
         PanelsByHost.Clear();
         PanelsByRow.Clear();
+        SliderBindings.Clear();
         StartedMenus.Clear();
         BuildFailures.Clear();
     }
@@ -1955,42 +2513,53 @@ internal sealed class SettingsPanel
             }
             catch (Exception exception)
             {
-                Log.LogWarning("Could not refresh a Upscaling panel: " + exception.Message);
+                Log.LogWarning("Could not refresh a BigScale settings panel: " + exception.Message);
             }
         }
     }
 
-    /// <summary>Keeps the Upscaling tab in the game's own category list if a stock lifecycle rebuilt it.</summary>
+    /// <summary>Keeps every owned tab in the game's own category list if a stock lifecycle rebuilt it.</summary>
     private void EnsureCategoryButtonListed()
     {
-        if (_disposed || _categoryButton == null || _catagory == null) return;
-        try
+        if (_disposed) return;
+        for (var i = 0; i < _pages.Count; i++)
         {
-            var list = _menu.buttonList;
-            var source = _menu.catagoryGraphics != null ? _menu.catagoryGraphics.catagoryButton : null;
-            var button = _categoryButton.GetComponent<Button>();
-            if (list == null || source == null || button == null) return;
-            if (_categoryButtonPointer == IntPtr.Zero) _categoryButtonPointer = button.Pointer;
-            var pointer = _categoryButtonPointer;
-            for (var i = 0; i < list.Count; i++)
+            var page = _pages[i];
+            if (page.CategoryButton == null || page.Catagory == null) continue;
+            try
             {
-                var candidate = list[i];
-                if (candidate != null && candidate.Pointer == pointer) return;
+                var list = _menu.buttonList;
+                Selectable? source = i == 0
+                    ? (_menu.catagoryGraphics != null ? _menu.catagoryGraphics.catagoryButton : null)
+                    : _pages[i - 1].ButtonSelectable;
+                var button = page.CategoryButton.GetComponent<Button>();
+                if (list == null || source == null || button == null) continue;
+                if (page.ButtonPointer == IntPtr.Zero) page.ButtonPointer = button.Pointer;
+                var pointer = page.ButtonPointer;
+                var listed = false;
+                for (var j = 0; j < list.Count; j++)
+                {
+                    var candidate = list[j];
+                    if (candidate == null || candidate.Pointer != pointer) continue;
+                    listed = true;
+                    break;
+                }
+                if (listed) continue;
+                var sourcePointer = source.Pointer;
+                var insertAt = list.Count;
+                for (var j = 0; j < list.Count; j++)
+                {
+                    var candidate = list[j];
+                    if (candidate == null || candidate.Pointer != sourcePointer) continue;
+                    insertAt = j + 1;
+                    break;
+                }
+                list.Insert(Mathf.Clamp(insertAt, 0, list.Count), button);
             }
-            var sourcePointer = source.Pointer;
-            var insertAt = list.Count;
-            for (var i = 0; i < list.Count; i++)
+            catch (Exception exception)
             {
-                var candidate = list[i];
-                if (candidate == null || candidate.Pointer != sourcePointer) continue;
-                insertAt = i + 1;
-                break;
+                Log.LogWarning("Could not keep a BigScale category tab in the button list: " + exception.Message);
             }
-            list.Insert(Mathf.Clamp(insertAt, 0, list.Count), button);
-        }
-        catch (Exception exception)
-        {
-            Log.LogWarning("Could not keep the Upscaling category tab in the button list: " + exception.Message);
         }
     }
 
@@ -1999,7 +2568,12 @@ internal sealed class SettingsPanel
         if (_disposed) return;
         EnsureCategoryButtonListed();
         ApplyCategoryLayout();
-        if (_localisationStripped) Refresh();
+        foreach (var page in _pages)
+        {
+            if (!page.LocalisationStripped) continue;
+            Refresh();
+            return;
+        }
     }
 
     /// <summary>
@@ -2039,7 +2613,6 @@ internal sealed class SettingsPanel
 
         internal static void AfterDisable(SettingsMenu __instance)
         {
-            Plugin.Instance?.Menu?.SettingsClosed();
             var panel = ForMenu(__instance);
             if (panel != null) panel.Hide();
             else HideAll();
@@ -2053,7 +2626,8 @@ internal sealed class SettingsPanel
         {
             var panel = ForMenu(__instance);
             if (panel == null) return;
-            if (__instance.activeCatagory == panel._catagory) return;
+            foreach (var page in panel._pages)
+                if (__instance.activeCatagory == page.Catagory) return;
             panel.Hide();
         }
 
@@ -2094,6 +2668,32 @@ internal sealed class SettingsPanel
             return false;
         }
 
+        internal const int HookCount = 13;
+
+        internal static void AfterSliderPointerUp(Selectable __instance) => CommitSliderFromUi(__instance);
+        internal static void AfterSliderDeselect(Selectable __instance) => CommitSliderFromUi(__instance);
+        internal static void AfterSliderMove(Slider __instance) => CommitSliderFromUi(__instance);
+
+        /// <summary>
+        /// Writes a pending slider preview when the UI releases or steps its Slider. A Slider is a
+        /// <see cref="Selectable"/>, so the registry key is the same instance id either hook receives.
+        /// </summary>
+        private static void CommitSliderFromUi(Selectable instance)
+        {
+            if (instance == null) return;
+            try
+            {
+                if (!SliderBindings.TryGetValue(instance.GetInstanceID(), out var binding)) return;
+                var panel = binding.Owner;
+                if (panel == null || panel._disposed) return;
+                panel.CommitNeuralSlider(binding);
+            }
+            catch (Exception exception)
+            {
+                Log.LogWarning("Could not commit a Neural Rendering slider from the UI: " + exception.Message);
+            }
+        }
+
         /// <summary>Installs every hook, reporting each failure individually.</summary>
         internal static int Install(Harmony harmony, Action<string> log)
         {
@@ -2113,6 +2713,14 @@ internal sealed class SettingsPanel
             installed += Patch(harmony, typeof(SettingsRow), "ActionCycle", nameof(BeforeCycle),
                 new[] { typeof(int) }, log);
             installed += Patch(harmony, typeof(SettingsRow), "Refresh", nameof(BeforeRefresh), null, log);
+            // The pointer-release hooks commit the preview the drag listener only previews. OnMove
+            // runs after Slider.Set, so its postfix sees the stepping value already recorded.
+            installed += Patch(harmony, typeof(Selectable), "OnPointerUp", nameof(AfterSliderPointerUp),
+                new[] { typeof(PointerEventData) }, log);
+            installed += Patch(harmony, typeof(Selectable), "OnDeselect", nameof(AfterSliderDeselect),
+                new[] { typeof(BaseEventData) }, log);
+            installed += Patch(harmony, typeof(Slider), "OnMove", nameof(AfterSliderMove),
+                new[] { typeof(AxisEventData) }, log, postfix: true);
             return installed;
         }
 

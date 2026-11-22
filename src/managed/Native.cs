@@ -1,6 +1,7 @@
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using BigScale.Core;
 
 namespace BigScale;
 
@@ -13,7 +14,13 @@ internal static class Native
     internal const string Dll = "BigScale.Native";
 
     /// <summary>Bumped whenever a shared struct changes. Both sides refuse a mismatch.</summary>
-    internal const uint AbiVersion = 4;
+    internal const uint AbiVersion = 5;
+
+    /// <summary>
+    /// Independent version of <see cref="NeuralConfig"/> so the neural parameter surface can grow
+    /// without invalidating the frame ABI. Native refuses a foreign value.
+    /// </summary>
+    internal const uint NeuralAbiVersion = 1;
 
     /// <summary>
     /// Cached blittable sizes. <c>Marshal.SizeOf</c> is not free and a packet is built every frame.
@@ -36,6 +43,7 @@ internal static class Native
         nameof(Frame.Reserved), nameof(Frame.ResourceTag), nameof(Frame.Upscaler),
         nameof(Frame.CameraNear), nameof(Frame.CameraFar), nameof(Frame.VerticalFovRadians),
         nameof(Frame.PreExposure), nameof(Frame.FgCaptureTag),
+        nameof(Frame.NeuralMask), nameof(Frame.NeuralMaskWidth), nameof(Frame.NeuralMaskHeight),
     };
 
     /// <summary>Field order of <see cref="Completion"/>.</summary>
@@ -62,7 +70,7 @@ internal static class Native
         nameof(Status.Mode4),
         nameof(Status.View0), nameof(Status.View1),
         nameof(Status.ViewCount), nameof(Status.BilinearComparisons), nameof(Status.FaultCount),
-        nameof(Status.Reserved), nameof(Status.CompletionPublished), nameof(Status.CompletionBase),
+        nameof(Status.NeuralState), nameof(Status.CompletionPublished), nameof(Status.CompletionBase),
         nameof(Status.Completion0), nameof(Status.Completion1), nameof(Status.Completion2),
         nameof(Status.Completion3), nameof(Status.Completion4), nameof(Status.Completion5),
         nameof(Status.Completion6), nameof(Status.Completion7),
@@ -98,6 +106,17 @@ internal static class Native
     [DllImport(Dll, EntryPoint = "BIGSCALE_SetEngineVersion", CallingConvention = CallingConvention.Cdecl)]
     internal static extern void SetEngineVersion([MarshalAs(UnmanagedType.LPUTF8Str)] string engineVersion);
 
+    /// <summary>
+    /// Turns <c>BepInEx/BigScale/native.log</c> on (1) or off (0). Calling it with 0 before
+    /// <see cref="Initialize"/> keeps the file from being created at all.
+    /// </summary>
+    /// <remarks>
+    /// An older bridge that predates this export throws <see cref="EntryPointNotFoundException"/>,
+    /// which the caller latches: the old native default is logging enabled.
+    /// </remarks>
+    [DllImport(Dll, EntryPoint = "BIGSCALE_SetNativeLog", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void SetNativeLog(int enabled);
+
     [DllImport(Dll, EntryPoint = "BIGSCALE_GetRenderEvent", CallingConvention = CallingConvention.Cdecl)]
     internal static extern IntPtr GetRenderEvent();
 
@@ -106,6 +125,14 @@ internal static class Native
 
     [DllImport(Dll, EntryPoint = "BIGSCALE_GetStatus", CallingConvention = CallingConvention.Cdecl)]
     internal static extern int GetStatus(ref Status status);
+
+    /// <summary>
+    /// Copies the neural configuration natively under its own mutex and publishes Off or Waiting.
+    /// Returns 0 on accept and <see cref="ErrorAbiMismatch"/> for a null pointer, a foreign
+    /// <see cref="NeuralConfig.Abi"/> or a <see cref="NeuralConfig.Size"/> that is not 44.
+    /// </summary>
+    [DllImport(Dll, EntryPoint = "BIGSCALE_ConfigureNeuralRendering", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int ConfigureNeuralRendering(ref NeuralConfig config);
 
     /// <summary>Queues a render-thread drain. Safe to call from the managed main thread.</summary>
     [DllImport(Dll, EntryPoint = "BIGSCALE_RequestShutdown", CallingConvention = CallingConvention.Cdecl)]
@@ -147,8 +174,22 @@ internal static class Native
     internal const int StateFaulted = 4;
     internal const int StateShutdown = 5;
 
+    /// <summary>
+    /// <c>BIGSCALE_NeuralState</c> wire values, aliased from the managed mirror so the panel, the
+    /// configuration and this ABI mirror can never drift apart.
+    /// </summary>
+    internal const int NeuralOff = NeuralRenderingState.Off;
+    internal const int NeuralWaiting = NeuralRenderingState.Waiting;
+    internal const int NeuralActive = NeuralRenderingState.Active;
+    internal const int NeuralRuntimeMissing = NeuralRenderingState.RuntimeMissing;
+    internal const int NeuralFailed = NeuralRenderingState.Failed;
+    internal const int NeuralUnsupported = NeuralRenderingState.Unsupported;
+
     /// <summary>An old-provider packet that was retired without executing, never a backend fault.</summary>
     internal const int ErrorStalePacket = 19;
+
+    /// <summary>Returned by <see cref="ConfigureNeuralRendering"/> for a null, foreign or misframed config.</summary>
+    internal const int ErrorAbiMismatch = 1;
 
     /// <summary>Maximum completions published per status snapshot.</summary>
     internal const int CompletionCapacity = 8;
@@ -246,6 +287,57 @@ internal static class Native
         public float VerticalFovRadians;
         public float PreExposure;
         public uint FgCaptureTag;
+
+        /// <summary>
+        /// Optional mod-owned character mask at the output extent: an R8_UNORM <c>ID3D11Texture2D</c>
+        /// (white where a character was drawn) or null when masking is off. The managed render graph
+        /// owns the texture for the whole pass, so the bridge copies this pointer without AddRef and
+        /// never releases it.
+        /// </summary>
+        public IntPtr NeuralMask;
+        public int NeuralMaskWidth;
+        public int NeuralMaskHeight;
+    }
+
+    /// <summary>
+    /// Sequential 4-byte neural configuration block (44 bytes). Values cross verbatim: the native
+    /// stage owns clamping and feature creation, so this path never blocks on GPU or SDK work.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    internal struct NeuralConfig
+    {
+        /// <summary>Must be <see cref="NeuralAbiVersion"/>.</summary>
+        public uint Abi;
+
+        /// <summary>Must be 44, the native <c>sizeof(BIGSCALE_NeuralConfig)</c>.</summary>
+        public uint Size;
+
+        /// <summary>1 when the master switch is on and an upscaler is selected.</summary>
+        public int Enabled;
+
+        /// <summary>0 Default, 1 Natural, 2 Cinematic.</summary>
+        public int Style;
+
+        /// <summary>0 BeforeUpscaling, 1 AfterUpscaling.</summary>
+        public int Timing;
+
+        /// <summary>1..5 sequential neural layers.</summary>
+        public int Passes;
+
+        /// <summary>0..2.</summary>
+        public float Strength;
+
+        /// <summary>0..2 local structure strength.</summary>
+        public float Detail;
+
+        /// <summary>0..2 local tone strength, applied to the first pass only.</summary>
+        public float Tone;
+
+        /// <summary>1 when the mod-owned character mask may be sampled.</summary>
+        public int CharacterMask;
+
+        /// <summary>Zero.</summary>
+        public int Reserved;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -331,7 +423,12 @@ internal static class Native
         public uint ViewCount;
         public uint BilinearComparisons;
         public uint FaultCount;
-        public uint Reserved;
+
+        /// <summary>
+        /// Last <c>BIGSCALE_NeuralState</c> wire value, refreshed by every
+        /// <c>BIGSCALE_ConfigureNeuralRendering</c>. See the <c>Neural*</c> constants on this class.
+        /// </summary>
+        public int NeuralState;
 
         public uint CompletionPublished;
         public uint CompletionBase;

@@ -1,27 +1,50 @@
 # Changelog
 
-## BigScale 1.0.0 — 2026-11-20
+## BigScale 1.0.0 — 2026-11-22
 
 First public release under the name **BigScale**. The project was previously distributed as
 BigWalkDLSS; this release is a clean break rather than a rename in place.
+
+### Neural Rendering (experimental, DLSS5)
+- Opt-in NGX feature-18 stage that runs before or after the selected upscaler and always before
+  frame generation. It reuses the D3D11↔D3D12 interop bridge and the converted per-eye scratch
+  textures; a missing runtime, unsupported GPU/layout, extent below 256×256 or create/evaluate
+  failure leaves the upscaler and frame generation untouched.
+- New `[DLSS5]` configuration and a second `Neural Rendering` settings category with a master
+  switch, Default/Natural/Cinematic presets, timing, three strength sliders, 1–5 sequential passes,
+  a character mask and a read-only status row. `[DLSS5] Enabled` is only the category gate.
+- The user-supplied `nvngx_dlssnr.dll` is never redistributed. The bridge exports the five NGX D3D12
+  entry points and is copied as `nvngx.dll` beside the real runtime; no import table is patched.
+  The alias must be a distinct copy: a hard link to the already-loaded `BigScale.Native.dll` resolves
+  to that module, whose path lacks `nvngx.dll`, so the compatibility runtime rejects `Init_Ext`.
+- The bridge ABI is now 5: `BIGSCALE_Frame` (192 bytes) carries the character mask pointer/extent and
+  `BIGSCALE_Status.neuralState` reports the stage state.
+- The character mask covers what each player's own shaders draw, local body included: every
+  opaque character submesh is drawn with its material's forward pass into a private depth buffer,
+  and only pixels that received depth are masked. A flat silhouette of the local body had left an
+  unedited pill-shaped patch below the first-person view. Visibility is re-checked every frame
+  against the camera's culling mask; inactive objects, shadow-only proxies, transparent blob
+  shadows, decals, disabled renderers, non-mesh effects and the local nose are excluded.
 
 ### Identity and installation
 - Plugin GUID `raharu.bigscale`, plugin directory `BepInEx/plugins/BigScale`, data directory
   `BepInEx/BigScale` and configuration file `BepInEx/config/raharu.bigscale.cfg`.
 - Assemblies `BigScale.dll` and `BigScale.Native.dll`, native exports `BIGSCALE_*`, and CMake
-  targets `BigScale.Native`, `BigScale.NativeShaders` and `BigScaleChecks`. The shared struct layouts
-  are unchanged, so the ABI versions stay at 4 (super resolution), 7 (desktop frame generation) and
-  1 (VR frame generation).
-- No automatic migration and no automatic deletion of an old install. The installer fails with an
-  actionable message when `BepInEx/plugins/BigWalkDLSS` still exists, and the plugin refuses to run
-  beside a `local.bigwalk.*` renderer.
+  targets `BigScale.Native`, `BigScale.NativeShaders` and `BigScaleChecks`. The ABI versions are 5
+  (super resolution), 7 (desktop frame generation) and 1 (VR frame generation); the neural
+  configuration has its own `BIGSCALE_NEURAL_ABI_VERSION` 1.
+- No automatic migration and no automatic deletion of a pre-rename BigWalkDLSS install. The
+  installer fails with an actionable message when `BepInEx/plugins/BigWalkDLSS` still exists, and the
+  plugin refuses to run beside a `local.bigwalk.*` renderer. For a pre-release BigScale payload, the
+  installer replaces the 18 individual notice files with `THIRD-PARTY-NOTICES.txt`; a manual
+  `providers/anr` tree is preserved.
 
 ### Configuration
 - The schema is enum-typed and self-documenting: BepInEx's generated `# Acceptable values:` and
   `# Multiple values can be set` blocks are removed from this plugin's file after every save.
 - New development-only `[Diagnostics]` section: `Enabled`, `FrameCaptureKey`, `StageProbe`,
-  `XrProof` and `Dx12Validation`. These keys are configuration-only and never appear in the in-game
-  panel. `XrProof` and `Dx12Validation` are read once at startup and need a restart.
+  `XrProof`, `Dx12Validation` and `NativeLog`. These keys are configuration-only and never appear in
+  the in-game panel. `XrProof` and `Dx12Validation` are read once at startup and need a restart.
 - All legacy migration code is gone: no old key is read, migrated or deleted, and the removed
   bilinear-comparison switch is no longer special-cased.
 - `Upscaling/Off` and an unreadable provider disable the master switch and remember Dlss instead of
@@ -30,6 +53,8 @@ BigWalkDLSS; this release is a clean break rather than a rename in place.
 ### Frame generation
 - The Streamline provider stays in the source but is not selectable; a stored value is normalized to
   `Off` with one explanation. Its `sl.*.dll` runtimes are no longer part of the release payload.
+- ANR remains unshipped; the README links the newest ANR release and gives the `providers/anr` copy
+  path; selecting ANR without the tree reports the manual-install warning.
 - The presentation-proof boundary traces are compiled out of shipping builds; only the offline
   harness measures pair timing.
 
@@ -57,10 +82,11 @@ BigWalkDLSS; this release is a clean break rather than a rename in place.
 
 ### Packaging, documentation and licensing
 - Root `LICENSE` (Apache-2.0), a short root `NOTICE` with the full attribution in
-  `docs/licenses/NOTICE.md`, a `.gitignore`, and a rewritten `README.md`.
-- The release payload contains only this project's own files, the seven redistributable provider
-  runtimes and their licences. No game, BepInEx, Unity, Big Walk VR or Big Visuals assembly is
-  redistributed, and no `sl.*.dll` is shipped.
+  `docs/licenses/NOTICE.md`, a `.gitignore`, and a rewritten `README.md`. The release carries
+  `LICENSE`, `THIRD-PARTY-NOTICES.txt`, `README.txt` and `_ADDITIONAL_PROVIDERS.txt`; all 16 upstream
+  licence and notice texts plus the attribution narrative are preserved verbatim in the combined
+  notice. The installer preserves a manually installed `providers/anr` tree. No game, BepInEx, Unity,
+  Big Walk VR or Big Visuals assembly is redistributed, and no `sl.*.dll` is shipped.
 
 ## BigWalkDLSS history (pre-rename)
 

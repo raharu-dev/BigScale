@@ -5,6 +5,7 @@
 #include <d3d11_1.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
@@ -362,11 +363,21 @@ bool Dx12Interop::Begin(std::string& reason)
     }
     current_->list.Reset();
     current_->allocator.Reset();
-    if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&current_->allocator))) ||
-        FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, current_->allocator.Get(), nullptr,
-            IID_PPV_ARGS(&current_->list))))
+    const HRESULT allocatorResult =
+        device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&current_->allocator));
+    const HRESULT listResult = SUCCEEDED(allocatorResult)
+        ? device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, current_->allocator.Get(), nullptr,
+              IID_PPV_ARGS(&current_->list))
+        : allocatorResult;
+    if (FAILED(allocatorResult) || FAILED(listResult))
     {
-        reason = "the D3D12 command list could not be created";
+        const HRESULT removed = device_->GetDeviceRemovedReason();
+        char detail[160]{};
+        std::snprintf(detail, sizeof(detail),
+            "the D3D12 command list could not be created (allocator 0x%08x, list 0x%08x, removed 0x%08x)",
+            static_cast<unsigned>(allocatorResult), static_cast<unsigned>(listResult),
+            static_cast<unsigned>(removed));
+        reason = detail;
         return false;
     }
     current_->open = true;

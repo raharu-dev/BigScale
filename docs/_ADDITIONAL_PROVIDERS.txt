@@ -1,0 +1,70 @@
+BigScale - additional providers and runtimes (optional, not included)
+=====================================================================
+
+BigScale ships its standard DLSS, FidelityFX and XeSS runtimes. The optional files below are not
+required for the normal upscaling path; add or replace them yourself, keep their names exactly as
+written, and close Big Walk first.
+
+  ANR frame generation     providers\anr\nvngx_dlssg.dll       Apex Compute release
+  NVIDIA DLSS (optional)   nvngx_dlss.dll                     NVIDIA DLSS release
+  DLSS Neural Rendering    providers\dlss5\nvngx_dlssnr.dll   user-supplied
+
+ANR frame generation
+--------------------
+BigScale does not redistribute ANR. Its upstream add-on archive carries no redistribution grant.
+  1. Download the newest anr-fg-*-addon.zip from:
+       https://github.com/apex-compute/ANR/releases/latest
+  2. Copy the contents of "Apex Neural Rendering FG\dlssg" into:
+       BepInEx\plugins\BigScale\providers\anr
+     The file BepInEx\plugins\BigScale\providers\anr\nvngx_dlssg.dll must then exist.
+     Do not copy the add-on's other folders into the BigScale plugin directory.
+  3. Start Big Walk, open Settings, select the Upscaling category, and set Frame Generation
+     to ANR. OptiScaler and the ANR installer are not needed; BigScale loads the runtime itself.
+
+The nvngx_dlssg.dll at the plugin root is NVIDIA DLSS Frame Generation, not ANR. Only the copy under
+providers\anr belongs to ANR.
+
+NVIDIA DLSS Super Resolution
+----------------------------
+BigScale ships nvngx_dlss.dll at:
+  BepInEx\plugins\BigScale\nvngx_dlss.dll
+It is used by both the Dlss and DlssPresetL backends. You may replace it with a newer official
+runtime. Download the newest NVIDIA DLSS release from:
+  https://github.com/NVIDIA/DLSS/releases/latest
+Extract the 64-bit Windows runtime:
+  lib\Windows_x86_64\rel\nvngx_dlss.dll
+and copy it over the file above. Keep the name exactly nvngx_dlss.dll: BigScale points the NGX
+loader at its own plugin directory, so a copy in the game root is not used. A BigScale update
+stages its bundled copy again, so re-copy a newer runtime after each update. If a replacement is
+rejected, Dlss and DlssPresetL report the failure in the status line; the other backends are
+unaffected.
+
+DLSS Neural Rendering (experimental)
+------------------------------------
+The neural-rendering model nvngx_dlssnr.dll is user-supplied and is never redistributed by
+BigScale. Place the 40-series fp16 compatibility build at one of:
+  BepInEx\plugins\BigScale\providers\dlss5\nvngx_dlssnr.dll
+  BepInEx\plugins\BigScale\nvngx_dlssnr.dll
+The provider path wins when both exist. Check its hash with the source that supplied it; no
+download link is offered here. Without it, the Neural Rendering status row reports Runtime missing
+and the selected upscaler keeps working.
+
+Switching ANR on and off
+------------------------
+  ANR generates one intermediate frame per source, so its Frame Multiplier is fixed at 2x; the
+  multiplier row stays at 2x and cannot offer 3x or more.
+  Selecting ANR from Off or from another frame-generation provider starts it in place; no restart
+  is needed. Once ANR has run, selecting another provider needs a game restart, because ANR keeps
+  process-wide D3D12 hooks installed for the rest of the session. If the runtime is missing, ANR
+  cannot start and the status line reports:
+    ANR FG runtime is missing; check the mod page for how to install ANR
+  If the file is present but ANR fails to initialize, restart the game before selecting another
+  provider.
+
+Removing an optional runtime
+----------------------------
+  Close Big Walk first. Delete BepInEx\plugins\BigScale\providers\anr to remove ANR; if ANR was
+  active, select Off or another provider before closing and restart when the status line asks.
+  Delete nvngx_dlssnr.dll from either location to remove DLSS Neural Rendering. To revert a
+  replaced DLSS runtime, copy nvngx_dlss.dll from the matching BigScale release, or reinstall
+  BigScale.

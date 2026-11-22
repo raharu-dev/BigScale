@@ -5,6 +5,8 @@
 #include "Log.h"
 #include "fg/FrameGenerationProvider.h"
 #include "fg/FrameGenerationResources.h"
+#include "fg/FgAdaptiveCadence.h"
+#include "fg/FgCadence.h"
 #include "fg/FgCapture.h"
 #include "fg/FsrFgProvider.h"
 #include "fg/FgTestObserver.h"
@@ -21,8 +23,10 @@
 
 #include <MinHook.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -140,6 +144,35 @@ std::atomic<int32_t> g_provider{BIGSCALE_FG_PROVIDER_OFF};
 std::atomic<bool> g_xrActive{false};
 std::atomic<bool> g_menuVisible{false};
 std::atomic<uint32_t> g_multiplier{2};
+// Display-aware cadence. The configured multiplier is the request; the governor decides how many
+// presents per source frame the display can actually hold and pauses generation when even two do not
+// fit. Everything here is touched from the presenting thread except the published effective value,
+// the pause flag and the visibility cache, which are atomics.
+FgMultiplierGovernor g_governor;
+std::atomic<uint32_t> g_effectiveMultiplier{2};
+std::atomic<bool> g_governorReset{true};
+std::atomic<bool> g_pausedForCadence{false};
+// One capture per configuration is taken at the configured total so the provider can publish its
+// verdict before the governor starts pacing.
+std::atomic<bool> g_bootstrapPending{false};
+// The selected provider's proven maximum total, mirroring g_status.maxMultiplier for lock-free
+// reads on the present thread. 0 while unknown.
+std::atomic<uint32_t> g_provenMaximum{0};
+// Last accepted parent present, in seconds, for the source-interval measurement.
+double g_lastSourcePresentQpc = 0.0;
+bool g_sourcePresentValid = false;
+// One refresh interval of the display the game presents on, in milliseconds. Zero means unknown.
+double g_refreshMilliseconds = 0.0;
+bool g_refreshFailureLogged = false;
+uint32_t g_refreshQueryCountdown = 0;
+// The presenter child's current visibility, so the coordinator's per-tick request costs no window
+// operation when nothing changes.
+std::atomic<bool> g_presenterVisible{false};
+// Captures retired without provider work because a newer one was already queued.
+std::atomic<uint32_t> g_coalescedDrops{0};
+#if defined(BIGSCALE_TESTING)
+std::atomic<double> g_testRefreshMilliseconds{0.0};
+#endif
 std::atomic<HWND> g_parent{nullptr};
 std::atomic<HWND> g_child{nullptr};
 std::atomic<IDXGISwapChain*> g_childSwapchain{nullptr};
@@ -333,6 +366,9 @@ void ShowChildOnOwner(bool visible)
     if (child == nullptr) return;
     if (GetWindowThreadProcessId(child, nullptr) != GetCurrentThreadId()) return;
     ShowWindow(child, visible ? SW_SHOWNA : SW_HIDE);
+    // Every other caller reads the same value, so a repeated request from the coordinator's tick is
+    // answered without touching the window.
+    g_presenterVisible.store(visible);
 }
 
 // The provider worker can decide that the presenter must disappear (refusal, suspension, fault) but
@@ -408,6 +444,7 @@ bool CreateChild(HWND parent, std::string& reason)
     SetWindowPos(child, HWND_TOP, 0, 0, width, height, SWP_NOACTIVATE | SWP_HIDEWINDOW);
     g_child.store(child);
     g_parent.store(parent);
+    g_presenterVisible.store(false);
     Log("FG: presenter child window created (%dx%d).", width, height);
     return true;
 }
@@ -415,6 +452,7 @@ bool CreateChild(HWND parent, std::string& reason)
 void DestroyChild()
 {
     HWND child = g_child.exchange(nullptr);
+    g_presenterVisible.store(false);
     if (child != nullptr) DestroyWindow(child);
 }
 
@@ -643,11 +681,11 @@ bool EnsureSlotResources(CaptureSlot& slot, std::string& reason)
 }
 
 // Process-lifetime provider family. ANR installs D3D12 hooks that stay installed after every
-// feature release, so it can never share a process with another frame-generation SDK, and the other
-// SDKs can never be unloaded underneath it. The family is claimed by the first initialization
-// attempt and is never cleared: switching across it requires a process restart. The values are the
-// ABI's BIGSCALE_FG_FAMILY_* codes, and the worker publishes the claim through GetStatus so the UI can
-// report a cross-family selection before any capture happens.
+// feature release, so it can never share a process with another frame-generation SDK and the
+// other SDKs can never be unloaded underneath it. The first initialization attempt claims a
+// family and the claim is never cleared. Normal -> ANR is the one permitted in-process migration:
+// the normal adapter is destroyed first, then ANR claims the process for its lifetime. Every
+// other change, including away from ANR, still requires a process restart.
 enum class RuntimeFamily : uint32_t
 {
     Unused = BIGSCALE_FG_FAMILY_UNUSED,
@@ -668,6 +706,12 @@ RuntimeFamily FamilyOf(int32_t provider)
     if (provider == BIGSCALE_FG_PROVIDER_ANR) return RuntimeFamily::Anr;
     if (provider == BIGSCALE_FG_PROVIDER_STREAMLINE) return RuntimeFamily::Streamline;
     return RuntimeFamily::Normal;
+}
+
+bool FamilyTransitionAllowed(RuntimeFamily current, RuntimeFamily requested)
+{
+    if (current == RuntimeFamily::Unused || current == requested) return true;
+    return current == RuntimeFamily::Normal && requested == RuntimeFamily::Anr;
 }
 
 // Deliberately leaked, process-lifetime storage. A resident SDK's hooks may run until the process
@@ -701,6 +745,7 @@ void LatchRefusal(int32_t provider, uint32_t generation, const std::string& text
 // including when the initialization that follows it fails, so the UI never keeps guessing.
 void PublishCapability(uint32_t maximum)
 {
+    g_provenMaximum.store(maximum, std::memory_order_release);
     std::lock_guard<std::mutex> guard(g_status.mutex);
     g_status.maxMultiplier = maximum;
 }
@@ -851,12 +896,13 @@ bool EnsureAdapter(const CaptureSlot& slot, std::string& reason)
         Log("FG: %s active generation=%u %ux%u", g_adapter->Name(), generation, init.width, init.height);
     };
 
+    const RuntimeFamily currentFamily = g_family.load();
     const RuntimeFamily requestedFamily = FamilyOf(requested);
     const bool residentIncumbent = g_adapter != nullptr && g_adapter->ProcessResident();
-    // The approved process boundary: a process that has loaded either side never loads the other.
-    // The incumbent is suspended (resident) or released (normal), the child disappears and the
+    // Every family change the one-way rule does not permit, including any change away from ANR:
+    // the incumbent is suspended (resident) or released (normal), the child disappears and the
     // request is refused for this generation; the user's selection is kept so a restart activates it.
-    if (g_family.load() != RuntimeFamily::Unused && g_family.load() != requestedFamily)
+    if (!FamilyTransitionAllowed(currentFamily, requestedFamily))
     {
         std::string retireReason;
         if (!DestroyAdapter(retireReason))
@@ -924,14 +970,6 @@ bool EnsureAdapter(const CaptureSlot& slot, std::string& reason)
             return false;
         }
     }
-    std::string drainReason;
-    if (!DestroyAdapter(drainReason))
-    {
-        reason = drainReason;
-        SetState(BIGSCALE_FG_STATE_FAULTED, reason.c_str(), -1);
-        Log("FG: the previous provider could not be replaced: %s", reason.c_str());
-        return false;
-    }
     std::unique_ptr<IFrameGenerationProvider> adapter = MakeAdapter(requested);
     if (adapter == nullptr)
     {
@@ -949,6 +987,27 @@ bool EnsureAdapter(const CaptureSlot& slot, std::string& reason)
         reason = "the frame-generation device is not ready";
         return false;
     }
+    // A provider-specific install prerequisite must fail before the incumbent is destroyed and
+    // before its family is claimed. This keeps a missing ANR runtime non-destructive.
+    if (!adapter->Preflight(init, reason))
+    {
+        LatchRefusal(requested, generation, reason);
+        // Park the incumbent: the next compatible selection reuses the checked destroy/recreate
+        // path, and the status can never keep naming a provider that is not driving this request.
+        ClearAdapterIdentity();
+        RequestChildHidden();
+        SetState(BIGSCALE_FG_STATE_UNSUPPORTED, reason.c_str(), -1);
+        Log("FG: %s prerequisite failed: %s", adapter->Name(), reason.c_str());
+        return false;
+    }
+    std::string drainReason;
+    if (!DestroyAdapter(drainReason))
+    {
+        reason = drainReason;
+        SetState(BIGSCALE_FG_STATE_FAULTED, reason.c_str(), -1);
+        Log("FG: the previous provider could not be replaced: %s", reason.c_str());
+        return false;
+    }
     if (requested == BIGSCALE_FG_PROVIDER_XESS)
     {
         // A previous teardown released XeLL together with its adapter; recreate it before wiring the
@@ -961,7 +1020,14 @@ bool EnsureAdapter(const CaptureSlot& slot, std::string& reason)
     }
     // Claim the process-lifetime family immediately before the first SDK initialization attempt, so
     // even a partial initialization can never escape it.
-    if (g_family.load() == RuntimeFamily::Unused) g_family.store(requestedFamily);
+    const RuntimeFamily family = g_family.load();
+    if (family == RuntimeFamily::Unused)
+        g_family.store(requestedFamily);
+    else if (family == RuntimeFamily::Normal && requestedFamily == RuntimeFamily::Anr)
+    {
+        g_family.store(requestedFamily);
+        Log("FG: process family migrates from normal to ANR; the normal provider was released first.");
+    }
     SetState(BIGSCALE_FG_STATE_INITIALIZING, "initializing the frame-generation provider");
     // The capability query runs inside Initialize before anything it can fail on, so a truthful
     // maximum is published even when the initialization that follows is refused.
@@ -1327,6 +1393,45 @@ DWORD WINAPI WorkerProc(void*)
                 }
             }
 
+            // Latest-wins: generating a capture that is already older than another one waiting in
+            // the queue only adds presentation latency. This fires exclusively when the worker is
+            // behind (the governor is meant to prevent a backlog); the newest queued capture then
+            // becomes the next unit of work.
+            bool newerQueued = false;
+            {
+                // Slot state and the queue are read under both locks so the scan cannot observe a
+                // half-published entry. Nothing acquires these two in the opposite order: PushWorker
+                // holds only the queue mutex and the capture path holds only the slot mutex.
+                std::lock_guard<std::mutex> slotGuard(g_slotMutex);
+                std::lock_guard<std::mutex> queueGuard(g_workerMutex);
+                for (uint32_t i = 0; i < g_workerQueueCount; i++)
+                {
+                    const int32_t queuedIndex = g_workerQueue[i];
+                    if (queuedIndex < 0 || queuedIndex >= kSlotCount) continue;
+                    const CaptureSlot& queued = g_slots[queuedIndex];
+                    if (queued.phase != SlotPhase::Ready) continue;
+                    if (queued.frame.presentId > slot.frame.presentId)
+                    {
+                        newerQueued = true;
+                        break;
+                    }
+                }
+            }
+            if (newerQueued)
+            {
+                DeferredRetirement coalescedRetirement{};
+                {
+                    std::lock_guard<std::mutex> guard(g_slotMutex);
+                    if (slot.phase != SlotPhase::Generating) continue;
+                    coalescedRetirement = CancelSlotLocked(slot, -2);
+                }
+                Publish(coalescedRetirement);
+                const uint32_t drops = g_coalescedDrops.fetch_add(1) + 1;
+                if (drops == 1 || drops % 600 == 0)
+                    Log("FG: coalesced %u queued captures to keep presentation latency bounded", drops);
+                continue;
+            }
+
             {
                 std::lock_guard<std::mutex> guard(g_slotMutex);
                 const BIGSCALE_FG_Frame& frame = slot.frame;
@@ -1378,6 +1483,9 @@ DWORD WINAPI WorkerProc(void*)
                     {
                         g_status.lastSourceFrame = frame.frameIndex;
                         g_status.renderedPresents++;
+                        // The HUD reports what was actually presented for this capture, not what was
+                        // requested or decided after it was taken.
+                        g_status.activeMultiplier = slot.multiplier;
                     }
                     g_status.generatedPresents += generatedCount;
                     if (ok && generatedCount > 0)
@@ -1510,6 +1618,135 @@ bool StopWorker()
         g_workerEvent = nullptr;
     }
     return true;
+}
+
+// Monotonic seconds on the same clock FgCadence uses. The frequency is cached for the process: a
+// per-frame QueryPerformanceFrequency would be a syscall-shaped cost inside the present hook.
+double QpcSeconds()
+{
+    static const double frequency = []
+    {
+        LARGE_INTEGER value{};
+        if (!QueryPerformanceFrequency(&value) || value.QuadPart == 0) return 0.0;
+        return static_cast<double>(value.QuadPart);
+    }();
+    if (frequency <= 0.0) return 0.0;
+    return static_cast<double>(FgQpcNow()) / frequency;
+}
+
+// The refresh interval of the output the game presents on, in milliseconds; zero when it cannot be
+// measured. The governor then preserves the requested multiplier instead of guessing.
+double QueryRefreshMilliseconds(IDXGISwapChain* swapchain)
+{
+#if defined(BIGSCALE_TESTING)
+    const double testRefresh = g_testRefreshMilliseconds.load();
+    if (testRefresh > 0.0) return testRefresh;
+#endif
+    double result = 0.0;
+    IDXGIOutput* output = nullptr;
+    if (swapchain != nullptr && SUCCEEDED(swapchain->GetContainingOutput(&output)) && output != nullptr)
+    {
+        DXGI_OUTPUT_DESC desc{};
+        if (SUCCEEDED(output->GetDesc(&desc)))
+        {
+            DEVMODEW mode{};
+            mode.dmSize = sizeof(mode);
+            if (EnumDisplaySettingsW(desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) &&
+                mode.dmDisplayFrequency > 1u)
+                result = 1000.0 / static_cast<double>(mode.dmDisplayFrequency);
+        }
+        output->Release();
+    }
+    if (result <= 0.0 && !g_refreshFailureLogged)
+    {
+        g_refreshFailureLogged = true;
+        Log("FG: display refresh rate is unavailable; adaptive FG pacing is disabled until it can be queried");
+    }
+    return result;
+}
+
+// The cadence gate's admission test: the same swapchain/window identity CaptureMatch requires, minus
+// the capture-device and format checks, because the governor must measure the source cadence even
+// before the first capture established a device.
+bool ParentPresentCandidate(IDXGISwapChain* swapchain, UINT flags)
+{
+    if (swapchain == nullptr) return false;
+    if (g_provider.load() == BIGSCALE_FG_PROVIDER_OFF) return false;
+    if (g_xrActive.load() || g_menuVisible.load()) return false;
+    if ((flags & DXGI_PRESENT_TEST) != 0) return false;
+    if (swapchain == g_childSwapchain.load()) return false;
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swapchain->GetDesc(&desc)) || desc.OutputWindow != g_parent.load()) return false;
+    if (g_refreshQueryCountdown > 0) g_refreshQueryCountdown--;
+    // A failed query is retried every 600 parent presents (about 10 s at 60 fps), not every frame.
+    if (g_refreshMilliseconds <= 0.0 && g_refreshQueryCountdown == 0)
+    {
+        g_refreshMilliseconds = QueryRefreshMilliseconds(swapchain);
+        if (g_refreshMilliseconds <= 0.0) g_refreshQueryCountdown = 600;
+    }
+    return true;
+}
+
+// Measures the source interval, advances the governor and applies its verdict: publish the effective
+// multiplier, and pause the whole transport when not even a pair fits the display.
+void GovernorPresent(IDXGISwapChain* swapchain)
+{
+    (void)swapchain;
+    const double now = QpcSeconds();
+    // QpcSeconds is seconds; the cadence contract is milliseconds, like the refresh interval.
+    const bool hadPreviousSample = g_sourcePresentValid;
+    const double intervalMilliseconds = hadPreviousSample ? (now - g_lastSourcePresentQpc) * 1000.0 : 0.0;
+    g_lastSourcePresentQpc = now;
+    g_sourcePresentValid = true;
+    // The first present after a configuration has no interval to measure. Deciding on it would pause
+    // generation for want of evidence and could retire the bootstrap capture before the provider saw
+    // it, so the first real interval decides everything from the next frame on.
+    if (!hadPreviousSample) return;
+    if (g_governorReset.exchange(false)) g_governor.Reset();
+    const uint32_t configured = g_multiplier.load();
+    FgCadenceInput input{};
+    input.sourceIntervalMilliseconds = intervalMilliseconds;
+    input.refreshIntervalMilliseconds = g_refreshMilliseconds;
+    input.configuredMultiplier = configured;
+    // A provider that has already published its maximum bounds the ramp: asking for a value the
+    // provider refuses would otherwise surface as a refusal naming a total the caller never asked
+    // for. While the maximum is unknown the configured request is the only ceiling.
+    const uint32_t proven = g_provenMaximum.load(std::memory_order_acquire);
+    input.providerMaximum = proven > 1 ? proven : 6;
+    const uint32_t effective = g_governor.Observe(input);
+    // A bootstrap capture may still be on its way to the provider. Pausing before it lands would
+    // retire it and leave the provider with no verdict, so the request would never be refused or
+    // accepted in the caller's own terms. One present at the configured total is the whole cost.
+    if (g_bootstrapPending.load(std::memory_order_acquire))
+    {
+        // Never leave a stale pause behind this early return: the transport must keep presenting so
+        // the bootstrap capture can be taken.
+        g_pausedForCadence.store(false);
+        return;
+    }
+    if (effective != g_effectiveMultiplier.load())
+    {
+        g_effectiveMultiplier.store(effective);
+        std::lock_guard<std::mutex> guard(g_status.mutex);
+        g_status.activeMultiplier = effective;
+    }
+    if (effective < 2)
+    {
+        if (!g_pausedForCadence.exchange(true))
+        {
+            // The transition retires every queued capture and hides the presenter; the steady-state
+            // paused frames only keep the state and the reason current.
+            CancelOutstanding();
+            RequestChildHidden();
+            SetState(BIGSCALE_FG_STATE_SUSPENDED, "source framerate too high for this display");
+            Log("FG: %.2f ms source interval at %.2f ms refresh cannot hold %ux; frame generation paused",
+                intervalMilliseconds, g_refreshMilliseconds, configured);
+        }
+    }
+    else
+    {
+        g_pausedForCadence.store(false);
+    }
 }
 
 bool CaptureMatch(IDXGISwapChain* swapchain, UINT flags)
@@ -1750,6 +1987,19 @@ void ReportSuspension(const std::string& reason)
 
 bool PresentOwnedPath(IDXGISwapChain* swapchain, UINT flags, std::string& reason)
 {
+    if (!ParentPresentCandidate(swapchain, flags)) return false;
+    GovernorPresent(swapchain);
+    if (g_pausedForCadence.load())
+    {
+        // Generation cannot fit this source rate. The transition already retired outstanding work;
+        // this frame only hides the stale child (this hook is the window's owner thread) and keeps
+        // the state truthful. Returning false leaves the game's own sync interval and flags intact,
+        // so the real frame is presented exactly as it would be with generation off.
+        RequestChildHidden();
+        ApplyChildHideRequest();
+        SetState(BIGSCALE_FG_STATE_SUSPENDED, "source framerate too high for this display");
+        return false;
+    }
     if (!CaptureMatch(swapchain, flags)) return false;
     UpdateChildGeometry();
     if (!PresentSourceFrame(swapchain, reason))
@@ -1821,6 +2071,10 @@ HRESULT STDMETHODCALLTYPE ResizeBuffersHook(IDXGISwapChain* swapchain, UINT buff
     if (entry.entered && swapchain != nullptr && swapchain != g_childSwapchain.load())
     {
         CancelOutstanding();
+        // A resize may accompany a monitor change or a display-mode switch, so the refresh interval
+        // and its retry countdown are dropped and re-queried on the next parent present.
+        g_refreshMilliseconds = 0.0;
+        g_refreshQueryCountdown = 0;
         // Slot textures are their own allocations, not views of the backbuffer: only the provider is
         // retired. A free slot recreates its shared set on its next captured extent.
         g_adapterResetRequested.store(true);
@@ -1885,6 +2139,22 @@ bool InstallHooks()
 }
 }
 
+#if defined(BIGSCALE_TESTING)
+// Test-only display refresh override. A cadence decision has to be reproducible on any monitor, so
+// the harness pins the refresh instead of measuring the host's output. Zero restores the real
+// display and re-arms the query on the next eligible parent present.
+void FgTestSetDisplayRefreshMilliseconds(double milliseconds)
+{
+    if (!std::isfinite(milliseconds) || milliseconds <= 0.0) milliseconds = 0.0;
+    g_testRefreshMilliseconds.store(milliseconds);
+    if (milliseconds == 0.0)
+    {
+        g_refreshMilliseconds = 0.0;
+        g_governorReset.store(true);
+    }
+}
+#endif
+
 bool FrameGeneration::EnsureInstalled() { return InstallHooks(); }
 
 void FrameGeneration::SetDirectories(const std::wstring& runtimeDirectory, const std::wstring& dataDirectory)
@@ -1911,6 +2181,16 @@ void FrameGeneration::Configure(const BIGSCALE_FG_Config& config)
         Log("FG: requested total multiplier %u (generation=%u, provider=%d)", multiplier, config.generation,
             config.provider);
     g_multiplier.store(multiplier);
+    // Every configuration re-arms the governor from scratch: the previous rate decision belonged to
+    // the previous request. The bootstrap capture carries the configured total so the provider can
+    // publish its own verdict (Active, or a capability refusal naming the total the caller asked
+    // for). The governor takes over from the next present; a rate that cannot fit pauses before a
+    // second capture is taken.
+    g_governorReset.store(true);
+    g_effectiveMultiplier.store(g_multiplier.load());
+    g_bootstrapPending.store(true);
+    g_pausedForCadence.store(false);
+    g_sourcePresentValid = false;
     TraceFgBoundary("configure", config.provider, config.generation, -1,
         config.menuVisible != 0 ? "menu" : config.xrActive != 0 ? "xr" : config.provider == BIGSCALE_FG_PROVIDER_OFF ? "off" : "request");
     bool rearmed = true;
@@ -1923,6 +2203,7 @@ void FrameGeneration::Configure(const BIGSCALE_FG_Config& config)
             g_status.state == BIGSCALE_FG_STATE_UNSUPPORTED;
         // A provider change may never inherit the previous provider's discovered maximum.
         if (config.provider != g_status.requested) g_status.maxMultiplier = 0;
+        if (config.provider != g_status.requested) g_provenMaximum.store(0, std::memory_order_release);
         g_status.requested = config.provider;
         g_status.generation = config.generation;
         const bool inactive = config.provider == BIGSCALE_FG_PROVIDER_OFF || config.xrActive != 0 ||
@@ -1996,7 +2277,10 @@ bool FrameGeneration::SetPresenterVisible(bool visible)
     HWND child = g_child.load();
     if (child == nullptr) return false;
     if (GetWindowThreadProcessId(child, nullptr) != GetCurrentThreadId()) return false;
+    // The coordinator asks once per tick; a no-op request must not cost a window operation.
+    if (visible == g_presenterVisible.load()) return true;
     ShowWindow(child, visible ? SW_SHOWNA : SW_HIDE);
+    g_presenterVisible.store(visible);
     return true;
 }
 
@@ -2020,6 +2304,13 @@ void* FrameGeneration::Submit(const BIGSCALE_FG_Frame& frame)
     if (!entry.entered) return nullptr;
     if (g_provider.load() == BIGSCALE_FG_PROVIDER_OFF || g_xrActive.load() || g_menuVisible.load())
         return nullptr;
+    // The first capture after a configuration carries the configured total so the provider publishes
+    // its verdict; every later capture carries the multiplier the governor found feasible. One
+    // snapshot serves both the gate and the slot: a provider must never be handed fewer than two
+    // images because the governor dropped between the two reads.
+    const bool bootstrap = g_bootstrapPending.load(std::memory_order_acquire);
+    const uint32_t effectiveMultiplier = bootstrap ? g_multiplier.load() : g_effectiveMultiplier.load();
+    if (effectiveMultiplier < 2) return nullptr;
     std::lock_guard<std::mutex> guard(g_slotMutex);
     CaptureSlot* slot = nullptr;
     for (CaptureSlot& candidate : g_slots)
@@ -2044,8 +2335,11 @@ void* FrameGeneration::Submit(const BIGSCALE_FG_Frame& frame)
         return nullptr;
     }
     // Submission copies CPU metadata only; texture capture and bound-RTV lookup run in RenderEvent.
-    // The multiplier is part of that metadata so a queued capture keeps its own generation's value.
-    slot->multiplier = g_multiplier.load();
+    // The multiplier is part of that metadata so a queued capture keeps its own generation's value,
+    // and it is the value the governor found feasible for the frame that is being captured.
+    slot->multiplier = effectiveMultiplier;
+    // The bootstrap capture exists only to make the provider publish a verdict; it is now spent.
+    if (bootstrap) g_bootstrapPending.store(false, std::memory_order_release);
     slot->frame = frame;
     slot->serial = g_nextSerial++;
     slot->phase = SlotPhase::Submitted;
@@ -2321,7 +2615,7 @@ void FrameGeneration::BeginFrame(uint64_t presentId)
     g_presentId.store(presentId);
     const int32_t provider = g_provider.load();
     const bool armed = provider == BIGSCALE_FG_PROVIDER_XESS && !g_xrActive.load() && !g_menuVisible.load() &&
-        g_captureDevice.load() != nullptr;
+        g_captureDevice.load() != nullptr && g_effectiveMultiplier.load() >= 2;
     g_markerFrame.store(armed ? presentId : 0);
     if (!armed) return;
     std::string reason;

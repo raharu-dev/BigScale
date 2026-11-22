@@ -5,7 +5,10 @@
 
 .DESCRIPTION
   Compiles the native bridge with the pinned Visual Studio CMake generator and the managed plugin
-  with the .NET SDK, then stages only this mod's own files plus the required licence notices.
+  with the .NET SDK, then stages only this mod's own files plus LICENSE, THIRD-PARTY-NOTICES.txt,
+  README.txt and _ADDITIONAL_PROVIDERS.txt. The combined notice is composed from docs/licenses/ and
+  third_party/, and the staged payload is checked against its release contract: nine binaries and
+  those four text files.
   Game, BepInEx, interop, Big Walk VR and Big Visuals assemblies are never copied, and neither are
   the Streamline runtimes: that provider is not selectable in this release.
 #>
@@ -113,6 +116,27 @@ $plugin = Join-Path $distRoot 'BepInEx/plugins/BigScale'
 if (Test-Path -LiteralPath $distRoot) { Remove-Item -LiteralPath $distRoot -Recurse -Force }
 New-Item -ItemType Directory -Path $plugin -Force | Out-Null
 
+# One attribution file replaces the per-upstream copies. Order is part of the shipped document, so
+# the sources are listed here rather than discovered by wildcard.
+$noticeSections = @(
+    @{ Title = 'Unity Companion License'; Source = 'docs/licenses/UNITY-COMPANION-LICENSE.txt' },
+    @{ Title = 'NVIDIA RTX SDKs License'; Source = 'docs/licenses/NVIDIA-RTX-SDK-LICENSE.txt' },
+    @{ Title = 'AMD FidelityFX SDK License'; Source = 'third_party/fsr-sdk/docs/license.md' },
+    @{ Title = 'AMD FidelityFX SDK Third-Party Notices'; Source = 'third_party/fsr-sdk/3rdpartynotice.md' },
+    @{ Title = 'FidelityFX FSR 2 DX11 License'; Source = 'third_party/fsr2-dx11/LICENSE.txt' },
+    @{ Title = 'Intel XeSS SDK License'; Source = 'third_party/xess-sdk/LICENSE.txt' },
+    @{ Title = 'Intel XeSS Third-Party Programs'; Source = 'third_party/xess-sdk/third-party-programs.txt' },
+    @{ Title = 'MinHook License'; Source = 'third_party/minhook/LICENSE.txt' },
+    @{ Title = 'NVIDIA Streamline License'; Source = 'third_party/streamline/license.txt' },
+    @{ Title = 'NVIDIA Streamline Third-Party Licenses'; Source = 'third_party/streamline/3rd-party-licenses.md' },
+    @{ Title = 'MFGAdaUnlock License'; Source = 'third_party/mfg-ada-unlock/LICENSE' },
+    @{ Title = 'MFGAdaUnlock NEFH License'; Source = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/ampere/LICENSE.nefh' },
+    @{ Title = 'MFGAdaUnlock dashdogy License'; Source = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/LICENSE.dashdogy.txt' },
+    @{ Title = 'MFGAdaUnlock FFX API License'; Source = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/ffx_api/LICENSE.txt' },
+    @{ Title = 'MFGAdaUnlock MinHook License'; Source = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/third_party/minhook/LICENSE.txt' },
+    @{ Title = 'Valve OpenVR License'; Source = 'third_party/openvr/LICENSE' }
+)
+
 if ($managedOutput) { Copy-Item -LiteralPath $managedOutput -Destination $plugin }
 if ($nativeOutput) {
     Copy-Item -LiteralPath $nativeOutput -Destination $plugin
@@ -147,39 +171,83 @@ if ($nativeOutput) {
         Copy-Item -LiteralPath $staged.Path -Destination (Join-Path $plugin $staged.Name)
         Write-Step "Verified $($staged.Name) SHA-256 $actual"
     }
-
-    # Upstream licences for the staged runtimes and for the compiled-but-not-distributed provider.
-    $licenses = @(
-        @{ Path = 'third_party/xess-sdk/LICENSE.txt'; Name = 'XESS-LICENSE.txt' },
-        @{ Path = 'third_party/xess-sdk/third-party-programs.txt'; Name = 'XESS-THIRD-PARTY-PROGRAMS.txt' },
-        @{ Path = 'third_party/fsr2-dx11/LICENSE.txt'; Name = 'FIDELITYFX-LICENSE.txt' },
-        @{ Path = 'third_party/fsr-sdk/docs/license.md'; Name = 'FIDELITYFX-SDK-LICENSE.md' },
-        @{ Path = 'third_party/fsr-sdk/3rdpartynotice.md'; Name = 'FIDELITYFX-SDK-THIRD-PARTY-NOTICES.md' },
-        @{ Path = 'third_party/minhook/LICENSE.txt'; Name = 'MINHOOK-LICENSE.txt' },
-        @{ Path = 'third_party/streamline/license.txt'; Name = 'STREAMLINE-LICENSE.txt' },
-        @{ Path = 'third_party/streamline/3rd-party-licenses.md'; Name = 'STREAMLINE-THIRD-PARTY-LICENSES.md' },
-        @{ Path = 'third_party/mfg-ada-unlock/LICENSE'; Name = 'MFG-UNLOCK-LICENSE.txt' },
-        @{ Path = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/ampere/LICENSE.nefh'; Name = 'MFG-UNLOCK-NEFH-LICENSE.txt' },
-        @{ Path = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/LICENSE.dashdogy.txt'; Name = 'MFG-UNLOCK-DASHDDOGY-LICENSE.txt' },
-        @{ Path = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/ffx_api/LICENSE.txt'; Name = 'MFG-UNLOCK-FFX-API-LICENSE.txt' },
-        @{ Path = 'third_party/mfg-ada-unlock/src/addons/mfgunlock/xemfg/vendor/third_party/minhook/LICENSE.txt'; Name = 'MFG-UNLOCK-MINHOOK-LICENSE.txt' },
-        @{ Path = 'third_party/openvr/LICENSE'; Name = 'OPENVR-LICENSE.txt' }
-    )
-    foreach ($license in $licenses) {
-        $source = Join-Path $repo $license.Path
-        if (-not (Test-Path -LiteralPath $source)) { throw "Licence file missing: $source. Run scripts/fetch-deps.ps1." }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $plugin $license.Name)
-    }
 }
 
-$notices = Join-Path $repo 'docs/licenses'
-if (Test-Path -LiteralPath $notices) {
-    Copy-Item -Path (Join-Path $notices '*') -Destination $plugin -Recurse -Force
+# --- licence and notice -----------------------------------------------------------------------
+# Text is read with ReadAllText so a source's own encoding and line endings survive; the output is
+# UTF-8 without a BOM whatever the sources were.
+$narrative = Join-Path $repo 'docs/licenses/NOTICE.md'
+if (-not (Test-Path -LiteralPath $narrative)) { throw "Attribution narrative missing: $narrative" }
+
+$combined = New-Object System.Text.StringBuilder
+$null = $combined.AppendLine('BigScale - third-party notices')
+$null = $combined.AppendLine()
+$null = $combined.AppendLine('This file collects the attribution notices and complete licence texts for third-party')
+$null = $combined.AppendLine('components included in or compiled into BigScale. Each section retains its own licence; the')
+$null = $combined.AppendLine('compilation itself is not relicensed. BigScale''s own code is licensed under the Apache License')
+$null = $combined.AppendLine('2.0 in the accompanying LICENSE file.')
+$null = $combined.Append(([IO.File]::ReadAllText($narrative)).TrimEnd() + [Environment]::NewLine)
+
+$banner = '=' * 80
+foreach ($section in $noticeSections) {
+    $sectionPath = Join-Path $repo $section.Source
+    if (-not (Test-Path -LiteralPath $sectionPath)) {
+        throw "Notice source missing: $sectionPath. Run scripts/fetch-deps.ps1."
+    }
+    $null = $combined.AppendLine()
+    $null = $combined.AppendLine($banner)
+    $null = $combined.AppendLine($section.Title)
+    $null = $combined.AppendLine($banner)
+    $null = $combined.AppendLine()
+    $null = $combined.Append(([IO.File]::ReadAllText($sectionPath)).TrimEnd() + [Environment]::NewLine)
+}
+
+[IO.File]::WriteAllText((Join-Path $plugin 'THIRD-PARTY-NOTICES.txt'), $combined.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination (Join-Path $plugin 'LICENSE')
+Copy-Item -LiteralPath (Join-Path $repo 'docs/README-release.txt') -Destination (Join-Path $plugin 'README.txt')
+Copy-Item -LiteralPath (Join-Path $repo 'docs/_ADDITIONAL_PROVIDERS.txt') -Destination (Join-Path $plugin '_ADDITIONAL_PROVIDERS.txt')
+Write-Step "Composed THIRD-PARTY-NOTICES.txt from $($noticeSections.Count + 1) sources"
+
+# --- payload contract -------------------------------------------------------------------------
+# The release is a fixed shape, so a stray notice copy or a forgotten runtime fails the build here
+# rather than in the archive.
+$payloadFiles = @(Get-ChildItem -LiteralPath $plugin -Recurse -File)
+$textNames = @('LICENSE', 'THIRD-PARTY-NOTICES.txt', 'README.txt', '_ADDITIONAL_PROVIDERS.txt')
+$binaries = @(
+    'BigScale.dll', 'BigScale.Native.dll', 'amd_fidelityfx_framegeneration_dx12.dll',
+    'amd_fidelityfx_upscaler_dx12.dll', 'libxell.dll', 'libxess.dll', 'libxess_fg.dll',
+    'nvngx_dlss.dll', 'nvngx_dlssg.dll'
+)
+$strayText = @($payloadFiles | Where-Object {
+        ($_.Extension -eq '.txt' -or $_.Extension -eq '.md') -and $textNames -notcontains $_.Name
+    })
+if ($strayText.Count -gt 0) {
+    throw ("Payload carries text files that are not part of the release: " +
+        (($strayText | ForEach-Object { $_.Name }) -join ', ') +
+        '. The payload ships LICENSE, THIRD-PARTY-NOTICES.txt, README.txt and _ADDITIONAL_PROVIDERS.txt only.')
+}
+$missingText = @($textNames | Where-Object { -not (Test-Path -LiteralPath (Join-Path $plugin $_)) })
+if ($missingText.Count -gt 0) { throw "Payload is missing: $($missingText -join ', ')." }
+if ($nativeOutput -and $managedOutput) {
+    $expectedNames = @($binaries) + $textNames
+    $actualNames = @($payloadFiles | ForEach-Object { $_.Name })
+    $missing = @($expectedNames | Where-Object { $actualNames -notcontains $_ })
+    $unexpected = @($actualNames | Where-Object { $expectedNames -notcontains $_ })
+    $expectedCount = $binaries.Count + $textNames.Count
+    if ($missing.Count -gt 0 -or $unexpected.Count -gt 0 -or $payloadFiles.Count -ne $expectedCount) {
+        $detail = "Expected $expectedCount payload files ($($binaries.Count) binaries plus " +
+            ($textNames -join ', ') + "); found $($payloadFiles.Count)."
+        if ($missing.Count -gt 0) { $detail += " Missing: $($missing -join ', ')." }
+        if ($unexpected.Count -gt 0) { $detail += " Unexpected: $($unexpected -join ', ')." }
+        throw $detail
+    }
+    Write-Step "Payload contract verified: $($payloadFiles.Count) files"
 }
 
 # --- diagnostics symbols ----------------------------------------------------------------------
-# Symbols go into their own local archive. They are never staged into the plugin directory, so the
-# installed runtime is exactly the released binaries.
+# Native symbols go into their own local archive. The managed assembly is built without a PDB so
+# the shipping DLL carries no absolute build path. Neither symbol file is staged into the plugin
+# directory, so the installed runtime is exactly the released binaries.
 $symbols = @()
 if ($nativeOutput) {
     $nativePdb = [System.IO.Path]::ChangeExtension($nativeOutput, '.pdb')

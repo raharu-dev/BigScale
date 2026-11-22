@@ -142,9 +142,24 @@ public static class UpscalingModes
         _ => "Off",
     };
 
-    /// <summary>Largest total the multiplier row may offer: the provider's proven maximum, or 2x before proof.</summary>
-    public static int FrameMultiplierCeiling(FrameGenerationKind provider, int reportedMaximum) =>
-        provider == FrameGenerationKind.Off ? 0 : reportedMaximum >= 2 ? Math.Min(reportedMaximum, 6) : 2;
+    /// <summary>ANR's current release generates one intermediate frame, so 2x is its hard maximum.</summary>
+    public const int AnrMaxMultiplier = 2;
+
+    /// <summary>Largest total a provider may ever present, regardless of what it reports.</summary>
+    public static int ProviderMultiplierLimit(FrameGenerationKind provider) =>
+        provider == FrameGenerationKind.Anr ? AnrMaxMultiplier : 6;
+
+    /// <summary>
+    /// Largest total the multiplier row may offer: the provider's proven maximum, or 2x before proof,
+    /// never above the provider's fixed limit. ANR stays at 2x because its current release supports
+    /// only one generated frame.
+    /// </summary>
+    public static int FrameMultiplierCeiling(FrameGenerationKind provider, int reportedMaximum)
+    {
+        if (provider == FrameGenerationKind.Off) return 0;
+        var limit = ProviderMultiplierLimit(provider);
+        return reportedMaximum >= 2 ? Math.Min(reportedMaximum, limit) : Math.Min(2, limit);
+    }
 
     /// <summary>Short provider name used in the status headline.</summary>
     public static string ShortName(UpscalerKind kind) => kind switch

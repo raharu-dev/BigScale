@@ -246,8 +246,9 @@ internal static unsafe class NativeFg
         public uint RestartRequired;
 
         /// <summary>
-        /// Process family the native transport claimed: FamilyUnused, FamilyNormal or FamilyAnr. The
-        /// first SDK initialization attempt claims it for the rest of the process.
+        /// Process-lifetime provider family: Unused, Normal, Anr or Streamline. The first initialization
+        /// attempt claims a family; a normal family may migrate to ANR once, and the claim is otherwise
+        /// never cleared.
         /// </summary>
         public uint ProcessFamily;
         public fixed byte Reason[256];

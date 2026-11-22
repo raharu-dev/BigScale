@@ -8,9 +8,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
-    <!-- Portable symbols so the diagnostics artifact has managed data; they are never installed. -->
-    <DebugType>portable</DebugType>
-    <DebugSymbols>true</DebugSymbols>
+    <!-- No PDB for the shipping assembly: the portable PDB embeds the absolute build path in the
+         DLL's debug directory. The diagnostics archive carries the native symbols instead. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <!-- GameDir resolution: explicit property, then BIGSCALE_GAME_DIR. Nothing is machine-specific. -->
     <GameDir Condition="'$(GameDir)' == ''">$(BIGSCALE_GAME_DIR)</GameDir>

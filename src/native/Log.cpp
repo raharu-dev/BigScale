@@ -15,6 +15,9 @@ std::mutex g_mutex;
 FILE* g_file = nullptr;
 std::wstring g_logPath;
 std::wstring g_directory;
+// Off means no file handle and no file creation. Enabled by default so an old managed build that
+// never calls SetLogEnabled keeps the previous behaviour.
+bool g_enabled = true;
 
 // 16 MiB, matching the rotation the managed side documents.
 constexpr long long kRotateBytes = 16ll * 1024 * 1024;
@@ -65,8 +68,26 @@ void SetLogDirectory(const std::wstring& directory)
     }
     g_logPath = g_directory;
     g_logPath += L"\\native.log";
+    // Disabled keeps the path so a later enable can reopen the same file; no handle is opened, so
+    // the file is never created.
+    if (!g_enabled) return;
     RotateIfNeeded(g_logPath);
     // A failure here is silent: the manager still runs, and the next SetLogDirectory retries.
+    OpenFile(g_logPath);
+}
+
+void SetLogEnabled(bool enabled)
+{
+    std::lock_guard<std::mutex> guard(g_mutex);
+    if (g_enabled == enabled) return;
+    g_enabled = enabled;
+    if (!enabled)
+    {
+        CloseFile();
+        return;
+    }
+    if (g_logPath.empty()) return;
+    RotateIfNeeded(g_logPath);
     OpenFile(g_logPath);
 }
 
@@ -79,7 +100,7 @@ std::wstring LogDirectory()
 void Log(const char* format, ...)
 {
     std::lock_guard<std::mutex> guard(g_mutex);
-    if (g_file == nullptr) return;
+    if (!g_enabled || g_file == nullptr) return;
     SYSTEMTIME time{};
     GetLocalTime(&time);
     std::fprintf(g_file, "%02u:%02u:%02u.%03u ", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);

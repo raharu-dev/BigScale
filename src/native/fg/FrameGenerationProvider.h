@@ -87,6 +87,15 @@ public:
     // Creates every SDK context and the child presentation path. False means the provider cannot
     // run here; the reason is published verbatim.
     virtual bool Initialize(const FgInit& init, std::string& reason) = 0;
+    // Checks install prerequisites without loading the SDK, creating resources or touching the
+    // device. The transport calls this before a process-family transition so a missing runtime
+    // cannot claim the family. Default: no prerequisite.
+    virtual bool Preflight(const FgInit& init, std::string& reason)
+    {
+        (void)init;
+        (void)reason;
+        return true;
+    }
     // Records every GPU command for one source frame into present.list: SDK evaluation, proxy
     // copies and resource tagging. The worker closes and submits that list after it returns.
     virtual bool Record(FgPresent& present, std::string& reason) = 0;

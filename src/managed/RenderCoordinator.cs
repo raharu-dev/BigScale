@@ -43,6 +43,10 @@ internal sealed class RenderCoordinator
     private readonly XrProofMode _proof;
     private readonly XrArrayProof _xrArrayProof;
     private readonly PlayerMotionVectors _playerMotion;
+    // Main-thread renderer inventory plus the material the mask pass draws with; never touched from
+    // the render thread, which only reads the cached array and material it publishes.
+    private readonly CharacterMaskSource _characterMask;
+    private readonly CharacterMaskPass _maskPass;
 
     private readonly int[] _eyeWidths = new int[2];
     private readonly int[] _eyeHeights = new int[2];
@@ -150,7 +154,7 @@ internal sealed class RenderCoordinator
     private string? _xrScopeFailure;
     private int _xrScopeLogs;
 
-    // Last render-affecting values applied. Diagnostics and the menu key are deliberately absent:
+    // Last render-affecting values applied. Diagnostics are deliberately absent:
     // changing them must never reset rendering or clear a latched fault.
     private bool _lastEnabled;
     private UpscalerKind _lastUpscaler = UpscalerKind.Off;
@@ -167,6 +171,13 @@ internal sealed class RenderCoordinator
     private float _diagnosticWindowStart;
     private FrameGenerationKind _lastFrameGeneration = FrameGenerationKind.Off;
     private FrameGenerationKind _lastVrFrameGeneration = FrameGenerationKind.Off;
+    // Neural Rendering: the last acknowledged native state, the two render-affecting switches, and
+    // the one-time rejection notice. The rest of the neural configuration is pushed on every change
+    // without resetting super-resolution history.
+    private int _lastNeuralState = Native.NeuralWaiting;
+    private bool _lastNeuralMaster;
+    private NeuralRenderingTiming _lastNeuralTiming;
+    private bool _neuralConfigRejectedLogged;
 
     internal RenderCoordinator(Plugin plugin, ModSettings settings, BigVisualsCompatibility compatibility)
     {
@@ -183,11 +194,15 @@ internal sealed class RenderCoordinator
         _proof = new XrProofMode(plugin.LogInfo, settings);
         _xrArrayProof = new XrArrayProof(plugin.LogInfo, _xrVerify);
         _playerMotion = new PlayerMotionVectors(plugin.LogInfo);
+        _characterMask = new CharacterMaskSource(settings, plugin.LogInfo);
+        _maskPass = new CharacterMaskPass(plugin.LogInfo);
         _lastEnabled = settings.Enabled.Value;
         _lastUpscaler = settings.Upscaler.Value;
         _lastPreset = settings.Preset.Value;
         _lastFrameGeneration = settings.FrameGeneration.Value;
         _lastVrFrameGeneration = settings.VrFrameGeneration.Value;
+        _lastNeuralMaster = settings.DLSS5MasterEnabled.Value;
+        _lastNeuralTiming = settings.DLSS5Timing.Value;
     }
 
     internal FrameGenerationCoordinator FrameGeneration => _frameGeneration;
@@ -200,6 +215,15 @@ internal sealed class RenderCoordinator
     internal ViewHistory History => _history;
     internal BigVisualsCompatibility Compatibility => _compatibility;
     internal bool OwnsRendering => _ownership.Owned;
+
+    /// <summary>
+    /// The read-only Neural Rendering status row. The gate and master switch shadow the native state,
+    /// so a stale Active can never survive a disable; the fully qualified type avoids the collision
+    /// with this property's own name.
+    /// </summary>
+    internal string NeuralRenderingStatusText =>
+        BigScale.Core.NeuralRenderingStatusText.For(_settings.DLSS5Enabled.Value,
+            _settings.DLSS5MasterEnabled.Value, _settings.Upscaler.Value, _lastNeuralState);
 
     internal string StateLabel => _state switch
     {
@@ -272,7 +296,57 @@ internal sealed class RenderCoordinator
     {
         _renderEvent = renderEvent;
         _nativeReady = true;
+        // Initialization push: the native side must know the neural configuration before the first
+        // packet, because the first packet is where the stage is created.
+        PushNeuralConfig();
     }
+
+    /// <summary>
+    /// Copies the current neural settings into the native bridge. Never blocks on GPU or SDK work:
+    /// the export only validates, stores and republishes state. A rejected config is logged once and
+    /// leaves the selected upscaler and frame generation untouched.
+    /// </summary>
+    private void PushNeuralConfig()
+    {
+        var gate = _settings.DLSS5Enabled.Value;
+        var master = _settings.DLSS5MasterEnabled.Value;
+        var upscaler = _settings.Upscaler.Value;
+        var config = new Native.NeuralConfig
+        {
+            Abi = Native.NeuralAbiVersion,
+            Size = (uint)System.Runtime.InteropServices.Marshal.SizeOf<Native.NeuralConfig>(),
+            Enabled = gate && master && upscaler != UpscalerKind.Off ? 1 : 0,
+            Style = (int)_settings.DLSS5Preset.Value,
+            Timing = (int)_settings.DLSS5Timing.Value,
+            Passes = NeuralRenderingModes.ClampPasses(_settings.DLSS5Passes.Value),
+            Strength = NeuralRenderingModes.ClampUnit(_settings.DLSS5Strength.Value),
+            Detail = NeuralRenderingModes.ClampUnit(_settings.DLSS5Detail.Value),
+            Tone = NeuralRenderingModes.ClampUnit(_settings.DLSS5Tone.Value),
+            CharacterMask = _settings.DLSS5CharacterMask.Value ? 1 : 0,
+            Reserved = 0,
+        };
+        var result = Native.ConfigureNeuralRendering(ref config);
+        if (result == 0 || _neuralConfigRejectedLogged) return;
+        _neuralConfigRejectedLogged = true;
+        _plugin.LogError($"the native bridge rejected the Neural Rendering configuration (code {result}); " +
+                         "Neural Rendering remains off and the selected upscaler is untouched.");
+    }
+
+    /// <summary>
+    /// True when the mask may be recorded this frame: the same condition the native side treats as
+    /// effective enablement, plus the character-masking switch.
+    /// </summary>
+    private bool NeuralMaskingWanted() =>
+        _settings.DLSS5Enabled.Value &&
+        _settings.DLSS5MasterEnabled.Value &&
+        _settings.Upscaler.Value != UpscalerKind.Off &&
+        _settings.DLSS5CharacterMask.Value;
+
+    /// <summary>
+    /// Releases the character-mask inventory and material. Idempotent; called once from plugin
+    /// shutdown while the GPU is idle. No super-resolution state is touched.
+    /// </summary>
+    internal void ShutdownNeural() => _characterMask.Dispose();
 
     internal void SetSupportMessage(string message)
     {
@@ -916,6 +990,9 @@ internal sealed class RenderCoordinator
         // disabling the mod must restore the game's material lists and motion-vector modes, not leave
         // them corrected. XR stays excluded because the motion material disables XRMotionVectors.
         _playerMotion.Tick(_settings.Enabled.Value && !_xrActive);
+        // Main-thread renderer inventory. It scans at its own cadence and keeps its snapshot while
+        // neural masking is off, so this is not a per-frame allocation path.
+        _characterMask.Tick();
         _pass.AbandonStaleLeases(Time.frameCount);
         ConsumeAbandonedSwitches();
         _output.Collect();
@@ -995,6 +1072,9 @@ internal sealed class RenderCoordinator
         }
 
         var status = ReadStatus(0, 0, (int)_requestedUpscaler);
+        // The status read is the only source for the panel's neural row, so it is cached here rather
+        // than queried again by the panel.
+        _lastNeuralState = status.NeuralState;
         ProcessCompletions(status);
 
         // Frame generation follows master enablement independently of super resolution; its rows
@@ -1712,8 +1792,9 @@ internal sealed class RenderCoordinator
         var recorded = false;
         try
         {
-            if (!_pass.RecordReconstruction(graph, source, depth, motion, output, _frames, count, _renderEvent,
-                    resourceTag))
+            // Neural Rendering is desktop-2D only; the XR path never records a mask.
+            if (!_pass.RecordReconstruction(graph, source, depth, motion, output, TextureHandle.nullHandle,
+                    _frames, count, _renderEvent, resourceTag))
             {
                 _output.Rollback(resourceTag, count);
                 if (_pass.HasPendingFailure)
@@ -1873,6 +1954,9 @@ internal sealed class RenderCoordinator
         _history.Clear();
         _retired.Clear();
         ClearFit(previous == 0 ? "adopting the primary camera" : "the primary camera changed");
+        // The previous inventory described another view; the next tick rescans before the mask is
+        // recorded against this camera.
+        _characterMask.Invalidate();
         ResetXrIdentity();
         _plan.Reacquire(previous == 0 ? "waiting for the first camera boundary" : "primary camera changed");
         _frameGeneration.ResumeAfterScene();
@@ -1901,6 +1985,8 @@ internal sealed class RenderCoordinator
         _history.Clear();
         _retired.Clear();
         ClearFit(reason);
+        // A scene change invalidates the renderer snapshot even while masking is otherwise quiet.
+        _characterMask.Invalidate();
         ResetXrIdentity();
         _plan.Reacquire(reason);
         _frameGeneration.SuspendForScene();
@@ -2058,6 +2144,19 @@ internal sealed class RenderCoordinator
             colorDescriptor, motionDescriptor, resourceTag, out var buildError);
         if (count == 0) return KeepStock(buildError ?? "no logical views to reconstruct");
 
+        // The mask is only meaningful for a single desktop view: a packed or multipass layout would
+        // need one mask per eye, which the native stage does not accept. A mask failure only drops
+        // masking; the reconstruction proceeds unmasked and SR/FG never fault.
+        var mask = TextureHandle.nullHandle;
+        if (layout == Native.Layout2D && slices == 1 && NeuralMaskingWanted())
+        {
+            var maskMaterial = _characterMask.Material;
+            var maskMesh = _characterMask.FillMesh;
+            var maskDraws = _characterMask.Draws;
+            if (maskMaterial != null && maskMesh != null && maskDraws.Length > 0)
+                mask = _maskPass.Record(graph, cameraData, maskDraws, maskMaterial, maskMesh, outputWidth, outputHeight);
+        }
+
         var recording = false;
         // The generation is committed to the graph the moment this pass is recorded, not when the
         // callback eventually runs: a resize in between must not destroy the imported texture.
@@ -2067,7 +2166,7 @@ internal sealed class RenderCoordinator
             recording = true;
             StockPostProcessing.RecordProjectionSetup(graph);
             _stock.BeforeReconstruction(pass, graph, resourceData, cameraData, ref color);
-            if (!_pass.RecordReconstruction(graph, color, depth, motion, output, _frames, count, _renderEvent,
+            if (!_pass.RecordReconstruction(graph, color, depth, motion, output, mask, _frames, count, _renderEvent,
                     resourceTag))
             {
                 _output.Rollback(resourceTag, count);
@@ -2465,18 +2564,26 @@ internal sealed class RenderCoordinator
 
     /// <summary>
     /// Called when the panel or the config file changed a setting. Only render-affecting changes
-    /// reset the renderer; Diagnostics and the menu key must never invalidate history, clear a
-    /// latched fault or recreate frame generation.
+    /// reset the renderer; Diagnostics must never invalidate history, clear a latched fault or
+    /// recreate frame generation.
     /// </summary>
     internal void NotifySettingsChanged()
     {
         _settings.Normalize();
+        // The neural block is pushed before any early return: strength, style, detail, tone, passes
+        // and masking only reconfigure the native stage and must never reset super-resolution history.
+        if (_nativeReady) PushNeuralConfig();
         var enabled = _settings.Enabled.Value;
         var upscaler = _settings.Upscaler.Value;
         var preset = _settings.Preset.Value;
         var frameGeneration = _settings.FrameGeneration.Value;
         var vrFrameGeneration = _settings.VrFrameGeneration.Value;
-        var renderChanged = enabled != _lastEnabled || upscaler != _lastUpscaler || preset != _lastPreset;
+        // The master switch and the timing change which image path runs around the upscaler, so they
+        // advance the plan/history generation exactly like a provider change.
+        var neuralMaster = _settings.DLSS5MasterEnabled.Value;
+        var neuralTiming = _settings.DLSS5Timing.Value;
+        var renderChanged = enabled != _lastEnabled || upscaler != _lastUpscaler || preset != _lastPreset ||
+                            neuralMaster != _lastNeuralMaster || neuralTiming != _lastNeuralTiming;
         var frameGenerationChanged = frameGeneration != _lastFrameGeneration;
         var vrFrameGenerationChanged = vrFrameGeneration != _lastVrFrameGeneration;
         _lastEnabled = enabled;
@@ -2484,6 +2591,8 @@ internal sealed class RenderCoordinator
         _lastPreset = preset;
         _lastFrameGeneration = frameGeneration;
         _lastVrFrameGeneration = vrFrameGeneration;
+        _lastNeuralMaster = neuralMaster;
+        _lastNeuralTiming = neuralTiming;
         if (!renderChanged)
         {
             if (vrFrameGenerationChanged)

@@ -139,8 +139,9 @@ internal sealed class FrameGenerationCoordinator
     private int _lastRequested;
     private FrameGenerationKind _lastRequestedKind;
     // Total multiplier proven by the native capability query, indexed by FrameGenerationKind. Zero
-    // means unknown; the pinned FSR integration is fixed at 2x. A provider switch never borrows
-    // another provider's entry.
+    // means unknown; the pinned FSR integration is fixed at 2x and ANR is capped at 2x because its
+    // current release generates one intermediate frame. A provider switch never borrows another
+    // provider's entry.
     private readonly int[] _providerMaximum = { 0, 0, 2, 0, 0, 0 };
     private int _effectiveMultiplier = 2;
     private int _configuredMultiplier = int.MinValue;
@@ -156,27 +157,19 @@ internal sealed class FrameGenerationCoordinator
     internal string HudLine { get; private set; } = "FG: Off - 1x - Off";
 
     /// <summary>
-    /// True only for a provider/generation that the native transport's claimed process family
-    /// cannot run, i.e. when the selection needs a game restart. Derived from the selection, so it is
-    /// right the moment the provider changes; it is never inferred from a reason string and it is
-    /// false in VR, where the generator is intentionally disabled for the whole session.
+    /// True only when the process family the native transport already claimed cannot run the
+    /// requested provider, i.e. when the selection needs a game restart. A normal family can still
+    /// migrate to ANR in place; ANR -> any other provider is the remaining restart case. It is false
+    /// in VR, where the generator is intentionally disabled for the whole session.
     /// </summary>
     internal bool RestartRequiredFor(FrameGenerationKind requested) =>
         _hasStatus && _xr == 0 && !VrState.Active && RestartFor(_lastStatus, requested);
 
-    /// <summary>
-    /// The cross-family rule the native worker enforces. A process that initialized ANR can never
-    /// initialize another provider and vice versa, because ANR keeps its D3D12 hooks installed for
-    /// the rest of the process.
-    /// </summary>
+    /// The cross-family rule the native worker enforces. A normal-family process may migrate to
+    /// ANR in place after the normal provider is released. Once ANR owns the process it keeps its
+    /// D3D12 hooks installed, so every other provider needs a restart.
     private static bool RestartFor(in NativeFg.Status status, FrameGenerationKind requested) =>
-        requested != FrameGenerationKind.Off && status.ProcessFamily != NativeFg.FamilyUnused &&
-        status.ProcessFamily != (requested switch
-        {
-            FrameGenerationKind.Anr => NativeFg.FamilyAnr,
-            FrameGenerationKind.Streamline => NativeFg.FamilyStreamline,
-            _ => NativeFg.FamilyNormal,
-        });
+        FrameGenerationFamily.RestartRequired(status.ProcessFamily, requested);
 
     /// <summary>
     /// True when the stock FPS counter must be decorated: the player selected a generator and this
@@ -320,6 +313,8 @@ internal sealed class FrameGenerationCoordinator
         var maximum = requestedKind == FrameGenerationKind.Off
             ? 0
             : _providerMaximum[(int)requestedKind];
+        if (maximum > UpscalingModes.ProviderMultiplierLimit(requestedKind))
+            maximum = UpscalingModes.ProviderMultiplierLimit(requestedKind);
         var effectiveMultiplier = maximum > 0 ? Math.Min(remembered, maximum) : 2;
         if (effectiveMultiplier != _effectiveMultiplier)
         {
@@ -381,6 +376,7 @@ internal sealed class FrameGenerationCoordinator
             status.MaxMultiplier > 0)
         {
             var reported = (int)Math.Min(status.MaxMultiplier, 6u);
+            reported = Math.Min(reported, UpscalingModes.ProviderMultiplierLimit(requestedKind));
             if (reported >= 2 && reported != _providerMaximum[(int)requestedKind])
                 _providerMaximum[(int)requestedKind] = reported;
         }
@@ -447,7 +443,8 @@ internal sealed class FrameGenerationCoordinator
         var provider = status.ActiveProvider != 0
             ? (FrameGenerationKind)status.ActiveProvider
             : _lastRequestedKind;
-        var multiplier = Math.Max(2, _effectiveMultiplier);
+        var multiplier = status.ActiveMultiplier >= 2 ? (int)status.ActiveMultiplier
+            : Math.Max(2, _effectiveMultiplier);
         return _presentedRate.Observe(nowSeconds, status.Generation, provider, multiplier,
             status.RenderedPresents, status.GeneratedPresents, out var totalFps)
             ? totalFps
@@ -1199,7 +1196,7 @@ internal sealed class FrameGenerationCoordinator
         var confirmed = _activity.Confirmed(_generation, requested);
         var provider = confirmed ? _activity.ConfirmedProvider
             : status.ActiveProvider != 0 ? (FrameGenerationKind)status.ActiveProvider : requested;
-        var observed = status.ActiveMultiplier >= 2 ? (int)status.ActiveMultiplier : configured;
+        var observed = status.ActiveMultiplier >= 1 ? (int)status.ActiveMultiplier : configured;
 
         // A real SDK fault or refusal supersedes menu suspension and any historical proof.
         if (status.State == NativeFgState.Faulted)

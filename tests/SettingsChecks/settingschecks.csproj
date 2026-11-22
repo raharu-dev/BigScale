@@ -25,6 +25,7 @@
     <Compile Include="../../src/managed/ModSettings.cs" />
     <Compile Include="../../src/managed/Core/SettingsFileText.cs" />
     <Compile Include="../../src/managed/Core/UpscalingModes.cs" />
+    <Compile Include="../../src/managed/Core/NeuralRenderingModes.cs" />
   </ItemGroup>
 
   <!-- Only the assemblies the settings surface needs. The IL2CPP chainloader assembly, which owns the

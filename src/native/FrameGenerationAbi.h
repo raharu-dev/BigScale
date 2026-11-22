@@ -23,8 +23,9 @@
 #define BIGSCALE_FG_RETIREMENT_COUNT 8
 #define BIGSCALE_FG_RETIREMENT_QUEUE 64
 
-// Process-lifetime provider family. The first SDK initialization attempt in a process claims one
-// family, and the two families can never share a process. Never renumber.
+// Process-lifetime provider family. The first SDK initialization attempt claims one family.
+// A normal-family process may migrate to ANR in place after the normal provider is released;
+// once ANR has claimed the process, no other provider may load. Never renumber.
 #define BIGSCALE_FG_FAMILY_UNUSED 0u
 #define BIGSCALE_FG_FAMILY_NORMAL 1u
 #define BIGSCALE_FG_FAMILY_ANR 2u

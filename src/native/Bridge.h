@@ -14,7 +14,7 @@
 #endif
 
 // Bumped whenever a shared struct changes. Both sides refuse a mismatch.
-#define BIGSCALE_ABI_VERSION 4u
+#define BIGSCALE_ABI_VERSION 5u
 
 // Operation codes carried by BIGSCALE_Frame::operation.
 enum BIGSCALE_Operation : int32_t
@@ -227,6 +227,12 @@ struct BIGSCALE_Frame
     float verticalFovRadians; // 160
     float preExposure;        // 164
     uint32_t fgCaptureTag;    // 168
+    // Optional mod-owned character mask at the output extent: an R8_UNORM ID3D11Texture2D (white
+    // where a character was drawn) or nullptr when masking is off. Owned by the managed render graph
+    // for the whole pass, so the bridge copies this pointer without AddRef and never releases it.
+    void* neuralMask;         // 176
+    int32_t neuralMaskWidth;  // 184
+    int32_t neuralMaskHeight; // 188
 };
 
 // Thread-safe copied snapshot. BIGSCALE_GetStatus never calls an SDK or touches a D3D context.
@@ -252,7 +258,7 @@ struct BIGSCALE_Status
     uint32_t viewCount;               // 272
     uint32_t bilinearComparisons;     // 276
     uint32_t faultCount;              // 280
-    uint32_t reserved;                // 284
+    int32_t neuralState;              // 284 BIGSCALE_NeuralState, refreshed by every Configure
     uint32_t completionPublished;     // 288 oldest-unacknowledged records retained natively
     uint32_t completionBase;          // 292 sequence of the oldest retained record (0 when empty)
     BIGSCALE_Completion completions[BIGSCALE_COMPLETION_COUNT]; // 296, oldest first
@@ -260,6 +266,42 @@ struct BIGSCALE_Status
     int32_t activeUpscaler;           // 908 the backend that actually produced the last frame
     uint64_t providerVersionId;       // 912 64-bit implementation identity, zero when unavailable
     char backendReason[BIGSCALE_REASON_CAPACITY];      // 920 fixed UTF-8, NUL terminated
+};
+
+// Status neural state values, mirrored by managed NeuralRenderingStatusText. Off is the feature
+// switched off; Waiting is a configured stage that has not yet produced a frame; Active is a stage
+// whose most recent evaluation succeeded. RuntimeMissing, Failed and Unsupported are persistent
+// diagnostics that must never fault the selected upscaler or frame generation.
+enum BIGSCALE_NeuralState : int32_t
+{
+    BIGSCALE_NEURAL_OFF = 0,
+    BIGSCALE_NEURAL_WAITING = 1,
+    BIGSCALE_NEURAL_ACTIVE = 2,
+    BIGSCALE_NEURAL_RUNTIME_MISSING = 3,
+    BIGSCALE_NEURAL_FAILED = 4,
+    BIGSCALE_NEURAL_UNSUPPORTED = 5,
+};
+
+// Version of the neural configuration block, independent of the bridge ABI so the stage can grow
+// its parameter surface without invalidating the frame struct.
+#define BIGSCALE_NEURAL_ABI_VERSION 1u
+
+// Sequential 4-byte fields (Pack=4 by construction, 44 bytes asserted in Bridge.cpp). Values cross
+// verbatim: the native stage owns clamping and feature creation, so an out-of-range slider can
+// never reach the NGX parameter map unvalidated, and this path never blocks on GPU work.
+struct BIGSCALE_NeuralConfig
+{
+    uint32_t abi;            // 0  BIGSCALE_NEURAL_ABI_VERSION
+    uint32_t size;           // 4  sizeof(BIGSCALE_NeuralConfig)
+    int32_t enabled;         // 8  1 when the master switch is on and an upscaler is selected
+    int32_t style;           // 12 0 Default, 1 Natural, 2 Cinematic
+    int32_t timing;          // 16 0 BeforeUpscaling, 1 AfterUpscaling
+    int32_t passes;          // 20 1..5 sequential neural layers
+    float strength;          // 24 0..2
+    float detail;            // 28 0..2 local structure strength
+    float tone;              // 32 0..2 local tone strength, applied to the first pass only
+    int32_t characterMask;   // 36 1 when the mod-owned character mask may be sampled
+    int32_t reserved;        // 40 zero
 };
 
 BIGSCALE_EXPORT uint32_t BIGSCALE_GetAbiVersion();
@@ -275,6 +317,9 @@ BIGSCALE_EXPORT uint32_t BIGSCALE_GetStatusLayout(uint32_t* offsets, uint32_t co
 BIGSCALE_EXPORT uint32_t BIGSCALE_GetCompletionLayout(uint32_t* offsets, uint32_t count);
 BIGSCALE_EXPORT int32_t BIGSCALE_Initialize(const wchar_t* runtimeDirectory, const wchar_t* dataDirectory);
 BIGSCALE_EXPORT void BIGSCALE_SetEngineVersion(const char* engineVersion);
+// Turns BepInEx/BigScale/native.log on or off (0 disables). Additive: no ABI bump, no struct change.
+// Called with 0 before BIGSCALE_Initialize, the file is never created.
+BIGSCALE_EXPORT void BIGSCALE_SetNativeLog(int32_t enabled);
 BIGSCALE_EXPORT void* BIGSCALE_GetRenderEvent();
 // The exact D3D11 device the renderer is bound to, or null before the first packet.
 BIGSCALE_EXPORT void* BIGSCALE_GetBoundDevice();
@@ -282,6 +327,11 @@ BIGSCALE_EXPORT void* BIGSCALE_GetBoundDevice();
 BIGSCALE_EXPORT const wchar_t* BIGSCALE_GetRuntimeDirectory();
 BIGSCALE_EXPORT void* BIGSCALE_QueueFrame(const BIGSCALE_Frame* frame);
 BIGSCALE_EXPORT int32_t BIGSCALE_GetStatus(BIGSCALE_Status* status);
+// Copies the neural configuration under its own mutex, bumps the internal generation when any field
+// changes, and publishes Off when disabled or Waiting otherwise. Returns 0 on accept and
+// BIGSCALE_ERROR_ABI_MISMATCH for a null pointer, a foreign abi or a size that is not
+// sizeof(BIGSCALE_NeuralConfig). No value is clamped and no GPU or SDK work happens here.
+BIGSCALE_EXPORT int32_t BIGSCALE_ConfigureNeuralRendering(const BIGSCALE_NeuralConfig* config);
 // Drops every retained completion whose sequence is <= throughSequence.
 BIGSCALE_EXPORT void BIGSCALE_AckCompletions(uint32_t throughSequence);
 BIGSCALE_EXPORT void BIGSCALE_RequestShutdown();

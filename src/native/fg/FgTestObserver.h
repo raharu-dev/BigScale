@@ -111,6 +111,10 @@ void SetFgTestPhase(const char* phase);
 // dispatch's generated plane. Never enabled for quality phases or in a shipping build.
 void SetFgTestFsrResetIndicators(bool enabled);
 bool FgTestFsrResetIndicators();
+// Test-only display refresh override, in milliseconds per refresh. The cadence governor must make the
+// same decision on any monitor, so the harness pins the refresh instead of measuring the host's.
+// Passing 0 restores the real display: the next eligible parent present re-queries it.
+void FgTestSetDisplayRefreshMilliseconds(double milliseconds);
 // Test-only boundary trace. `stage` is a fixed literal ("configure", "render-admitted",
 // "capture-match-rejected", "present-token-missing", "worker-stale", "record-begin", ...). A
 // rejection stage is reported once per generation; a begin/end stage reports the first four source

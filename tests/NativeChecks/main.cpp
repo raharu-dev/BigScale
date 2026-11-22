@@ -7,10 +7,12 @@
 #include "Bridge.h"
 #include "ContextState.h"
 #include "EyeResources.h"
+#include "NeuralRendering.h"
 #include "NgxBackend.h"
 #include "StageProbe.h"
 #include "TexelReader.h"
 #include "FrameGenerationAbi.h"
+#include "fg/FgAdaptiveCadence.h"
 #include "fg/FrameGenerationResources.h"
 #include "fg/FgReadback.h"
 #include "fg/FgTestObserver.h"
@@ -888,20 +890,24 @@ bool WaitForDevice()
 
 void CheckAbi()
 {
-    Check(BIGSCALE_GetAbiVersion() == 4, "the bridge reports ABI 4");
-    Check(BIGSCALE_GetFrameSize() == 176, "the bridge reports a 176-byte frame");
+    Check(BIGSCALE_GetAbiVersion() == 5, "the bridge reports ABI 5");
+    Check(BIGSCALE_GetFrameSize() == 192, "the bridge reports a 192-byte frame");
     Check(BIGSCALE_GetStatusSize() == 1176, "the bridge reports a 1176-byte status");
     Check(BIGSCALE_GetCompletionSize() == 76, "the bridge reports a 76-byte completion");
     Check(BIGSCALE_MODE_COUNT == 5, "the mode block carries five neutral presets");
+    Check(sizeof(BIGSCALE_NeuralConfig) == 44, "the neural configuration is 44 bytes");
 
-    uint32_t offsets[40]{};
-    const uint32_t count = BIGSCALE_GetFrameLayout(offsets, 40);
-    Check(count == 39, "the frame layout reports 39 fields");
+    uint32_t offsets[42]{};
+    const uint32_t count = BIGSCALE_GetFrameLayout(offsets, 42);
+    Check(count == 42, "the frame layout reports 42 fields");
     Check(offsets[20] == 80, "the bridge reports the colour pointer at offset 80");
     Check(offsets[23] == 104, "the bridge reports the output pointer at offset 104");
     Check(offsets[32] == 144, "the bridge reports the resource tag at offset 144");
     Check(offsets[33] == 148, "the bridge reports the upscaler at offset 148");
     Check(offsets[38] == 168, "the bridge reports the FG capture tag at offset 168");
+    Check(offsets[39] == 176, "the bridge reports the neural mask at offset 176");
+    Check(offsets[40] == 184, "the bridge reports the neural mask width at offset 184");
+    Check(offsets[41] == 188, "the bridge reports the neural mask height at offset 188");
 
     uint32_t completionOffsets[19]{};
     Check(BIGSCALE_GetCompletionLayout(completionOffsets, 19) == 19, "the completion layout reports 19 fields");
@@ -910,11 +916,194 @@ void CheckAbi()
     uint32_t statusOffsets[40]{};
     Check(BIGSCALE_GetStatusLayout(statusOffsets, 40) == 40, "the status layout reports 40 fields");
     Check(statusOffsets[20] == 224, "the bridge reports views at offset 224");
+    Check(statusOffsets[25] == 284, "the bridge reports neuralState at offset 284");
     Check(statusOffsets[28] == 296, "the bridge reports completions at offset 296");
     Check(statusOffsets[36] == 904, "the bridge reports queryUpscaler at offset 904");
     Check(statusOffsets[37] == 908, "the bridge reports activeUpscaler at offset 908");
     Check(statusOffsets[38] == 912, "the bridge reports providerVersionId at offset 912");
     Check(statusOffsets[39] == 920, "the bridge reports backendReason at offset 920");
+
+    Check(BIGSCALE_ConfigureNeuralRendering(nullptr) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "a null neural configuration is refused");
+    BIGSCALE_NeuralConfig neural{};
+    neural.abi = BIGSCALE_NEURAL_ABI_VERSION + 1;
+    neural.size = sizeof(BIGSCALE_NeuralConfig);
+    Check(BIGSCALE_ConfigureNeuralRendering(&neural) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "a foreign neural ABI version is refused");
+    neural.abi = BIGSCALE_NEURAL_ABI_VERSION;
+    neural.size = sizeof(BIGSCALE_NeuralConfig) + 4;
+    Check(BIGSCALE_ConfigureNeuralRendering(&neural) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "a mismatched neural configuration size is refused");
+}
+
+// Adaptive frame-generation cadence: a requested multiplier is only displayable when one source
+// interval can hold that many presents at the display refresh. Both the fit function and the
+// governor are pure arithmetic, so every case names its own source interval and refresh instead of
+// depending on the host monitor.
+void CheckFgAdaptiveCadence()
+{
+    auto choose = [](double source, double refresh, uint32_t configured, uint32_t maximum)
+    {
+        FgCadenceInput input{};
+        input.sourceIntervalMilliseconds = source;
+        input.refreshIntervalMilliseconds = refresh;
+        input.configuredMultiplier = configured;
+        input.providerMaximum = maximum;
+        return FgChoosePresentedCount(input);
+    };
+    struct ChooseCase
+    {
+        double source;
+        double refresh;
+        uint32_t configured;
+        uint32_t maximum;
+        uint32_t expected;
+    };
+    const ChooseCase chooseCases[] = {
+        // 60 Hz display: one refresh is 16.7 ms.
+        {16.7, 16.7, 4, 6, 1},
+        {33.4, 16.7, 4, 6, 2},
+        {66.7, 16.7, 4, 6, 4},
+        {8.3, 16.7, 4, 6, 1},
+        // 120 Hz display: one refresh is 8.33 ms.
+        {25.0, 8.33, 4, 6, 3},
+        // The provider's proven ceiling caps the fit, not the configured request.
+        {33.3, 8.33, 4, 2, 2},
+        // An unknowable source interval or refresh preserves the request untouched.
+        {0.0, 16.7, 4, 6, 4},
+        {33.3, 0.0, 4, 6, 4},
+    };
+    for (const ChooseCase& testCase : chooseCases)
+    {
+        const uint32_t actual = choose(testCase.source, testCase.refresh, testCase.configured,
+            testCase.maximum);
+        char description[224]{};
+        std::snprintf(description, sizeof(description),
+            "cadence choose(source=%.2f ms, refresh=%.2f ms, requested=%ux, providerMax=%ux): expected %u, "
+            "got %u",
+            testCase.source, testCase.refresh, static_cast<unsigned>(testCase.configured),
+            static_cast<unsigned>(testCase.maximum), static_cast<unsigned>(testCase.expected),
+            static_cast<unsigned>(actual));
+        Check(actual == testCase.expected, description);
+    }
+
+    FgMultiplierGovernor governor;
+    auto observe = [&governor](double source)
+    {
+        FgCadenceInput input{};
+        input.sourceIntervalMilliseconds = source;
+        input.refreshIntervalMilliseconds = 16.7;
+        input.configuredMultiplier = 4;
+        input.providerMaximum = 6;
+        return governor.Observe(input);
+    };
+    governor.Reset();
+    const uint32_t firstSample = observe(33.4);
+    Check(firstSample == 4,
+        "governor: the first sample after a reset boots at the requested ceiling, not from one "
+        "interval (got " + std::to_string(firstSample) + "x)");
+    uint32_t settledTwo = firstSample;
+    int settleObservations = 0;
+    for (int frame = 0; frame < 6 && settledTwo != 2; frame++)
+    {
+        settledTwo = observe(33.4);
+        settleObservations = frame + 1;
+    }
+    Check(settledTwo == 2,
+        "governor: a 33.4 ms source at a 16.7 ms refresh settles at 2x within 6 observations (got " +
+            std::to_string(settledTwo) + "x after " + std::to_string(settleObservations) + ")");
+
+    // Raising must be slow and single-step: the smoothed interval has to fit the next count for 30
+    // consecutive source frames, and the count may only climb one at a time.
+    bool reachedFour = false;
+    bool monotone = true;
+    bool singleStep = true;
+    bool ceilingHeld = true;
+    int riseObservations = 0;
+    uint32_t previous = governor.Current();
+    for (int frame = 0; frame < 120; frame++)
+    {
+        const uint32_t current = observe(66.7);
+        if (current > 4) ceilingHeld = false;
+        if (current < previous) monotone = false;
+        if (current > previous + 1) singleStep = false;
+        if (current != previous)
+            std::printf("governor: raise step to %ux at observation %d\n", static_cast<unsigned>(current),
+                frame + 1);
+        previous = current;
+        if (!reachedFour && current == 4)
+        {
+            reachedFour = true;
+            riseObservations = frame + 1;
+        }
+    }
+    char riseDescription[256]{};
+    std::snprintf(riseDescription, sizeof(riseDescription),
+        "governor: 66.7 ms at a 16.7 ms refresh rises 2->3->4 within 120 observations, one step at a "
+        "time and never above 4 (reached=%d after %d, monotone=%d, singleStep=%d, ceilingHeld=%d)",
+        reachedFour ? 1 : 0, riseObservations, monotone ? 1 : 0, singleStep ? 1 : 0, ceilingHeld ? 1 : 0);
+    Check(reachedFour && monotone && singleStep && ceilingHeld, riseDescription);
+    const uint32_t settled = governor.Current();
+    Check(settled == 4, "governor: the settled count stays at the feasible 4x (got " +
+        std::to_string(settled) + "x)");
+
+    // Confirmation: a single double-present or scheduler outlier must not collapse the multiplier the
+    // display has been sustaining, while a genuine step change does drop.
+    const uint32_t afterOneLow = observe(16.7);
+    Check(afterOneLow == 4, "governor: one short interval does not drop a settled 4x (got " +
+        std::to_string(afterOneLow) + "x)");
+    const uint32_t afterTwoLow = observe(16.7);
+    Check(afterTwoLow == 1, "governor: two consecutive short intervals drop to 1x (got " +
+        std::to_string(afterTwoLow) + "x)");
+
+    uint32_t raisedValue = 1;
+    int raiseBackObservations = 0;
+    for (int frame = 0; frame < 90; frame++)
+    {
+        const uint32_t current = observe(33.4);
+        if (current != 1)
+        {
+            raisedValue = current;
+            raiseBackObservations = frame + 1;
+            break;
+        }
+    }
+    char raiseBackDescription[224]{};
+    std::snprintf(raiseBackDescription, sizeof(raiseBackDescription),
+        "governor: 33.4 ms raises the dropped 1x back to 2x within 90 observations (got %ux after %d)",
+        static_cast<unsigned>(raisedValue), raiseBackObservations);
+    Check(raisedValue == 2 && raiseBackObservations >= 1 && raiseBackObservations <= 90,
+        raiseBackDescription);
+
+    // Anti-flap: present intervals jitter around the M * refresh boundary by a couple of milliseconds
+    // on any real machine (the present lands slightly before or after its slot). Acting on a raw
+    // sample alone made generation alternate between 2x and 1x every few frames, cancelling and
+    // restarting captures and hiding the presenter each time. The smoothed interval decides, so a
+    // jittering source that fits on average must hold its multiplier.
+    uint32_t jitterValue = governor.Current();
+    int jitterDrops = 0;
+    for (int frame = 0; frame < 40; frame++)
+    {
+        const double interval = (frame % 2 == 0) ? 33.4 : 31.7;
+        jitterValue = observe(interval);
+        if (jitterValue < 2) jitterDrops++;
+    }
+    Check(jitterDrops == 0 && jitterValue == 2,
+        "governor: intervals jittering across the pair boundary never drop 2x (drops=" +
+            std::to_string(jitterDrops) + ", final=" + std::to_string(jitterValue) + "x)");
+
+    // A gap far longer than a refresh can only add room, so it must restore the ceiling immediately;
+    // holding the previous decision there is what turned a stall into a self-sustaining pause.
+    for (int frame = 0; frame < 4; frame++) observe(16.7);
+    const uint32_t beforeGap = governor.Current();
+    const uint32_t afterGap = observe(600.0);
+    Check(beforeGap == 1 && afterGap == 4,
+        "governor: a 600 ms gap restores the 4x ceiling (before=" + std::to_string(beforeGap) +
+            "x, after=" + std::to_string(afterGap) + "x)");
+    // A zero delta is a clock that did not advance, not a frame rate: no evidence either way.
+    const uint32_t afterZero = observe(0.0);
+    Check(afterZero == 4, "governor: an unmeasurable interval keeps the current decision (got " +
+        std::to_string(afterZero) + "x)");
 }
 
 void CheckRingAndProbe()
@@ -2413,6 +2602,434 @@ void RemoveTree(const std::wstring& directory)
     RemoveDirectoryW(directory.c_str());
 }
 
+// ---------------------------------------------------------------------------------------------
+// DLSS5 neural rendering. The runtime is user-supplied, so this mode proves the configuration ABI,
+// the bridge's state machine and, only when the compatibility DLL is staged next to the checks,
+// feature-18 creation, multipass evaluation and the character-mask composite on real D3D11 textures.
+// ---------------------------------------------------------------------------------------------
+constexpr UINT kNeuralExtent = 256;
+constexpr int32_t kNeuralCamera = 980;
+
+// One D3D11 fixture for a neural stage run: the inputs the Bridge hands the stage, the mod-owned
+// character mask, and (for after-upscale timing) the backend output the stage composites into.
+struct NeuralFixture
+{
+    ComPtr<ID3D11Texture2D> color;
+    ComPtr<ID3D11Texture2D> depth;
+    ComPtr<ID3D11Texture2D> motion;
+    ComPtr<ID3D11Texture2D> mask;
+    ComPtr<ID3D11Texture2D> output;
+    EvaluationRequest request{};
+};
+
+// R32_FLOAT has no packing ambiguity, so one constant-depth plane is enough for the guide.
+bool FillNeuralDepth(ID3D11Texture2D* texture, float depth)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    std::vector<float> texels(static_cast<size_t>(desc.Width) * desc.Height, depth);
+    D3D11_BOX box{0, 0, 0, desc.Width, desc.Height, 1};
+    g_context->UpdateSubresource(texture, 0, &box, texels.data(), desc.Width * sizeof(float),
+        desc.Width * desc.Height * sizeof(float));
+    return true;
+}
+
+// White on the left half, black on the right: the composite keeps the masked half and replaces the
+// unmasked half with the model answer, so a mask that never arrives is visible in the result.
+bool FillNeuralMask(ID3D11Texture2D* texture, UINT whiteColumns)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    std::vector<uint8_t> texels(static_cast<size_t>(desc.Width) * desc.Height, 0);
+    const uint8_t inside = 255;
+    const uint8_t outside = 0;
+    for (UINT y = 0; y < desc.Height; y++)
+    {
+        for (UINT x = 0; x < desc.Width; x++)
+            texels[static_cast<size_t>(y) * desc.Width + x] = x < whiteColumns ? inside : outside;
+    }
+    D3D11_BOX box{0, 0, 0, desc.Width, desc.Height, 1};
+    g_context->UpdateSubresource(texture, 0, &box, texels.data(), desc.Width, desc.Width * desc.Height);
+    return true;
+}
+
+bool MakeNeuralFixture(NeuralFixture& fixture)
+{
+    const UINT extent = kNeuralExtent;
+    fixture.color = CreateTexture(extent, extent, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+    fixture.depth = CreateTexture(extent, extent, 1, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+    fixture.motion = CreateTexture(extent, extent, 1, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+    fixture.mask = CreateTexture(extent, extent, 1, DXGI_FORMAT_R8_UNORM, D3D11_BIND_SHADER_RESOURCE);
+    fixture.output = CreateTexture(extent, extent, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+    if (!fixture.color || !fixture.depth || !fixture.motion || !fixture.mask || !fixture.output) return false;
+
+    FillColor(fixture.color.Get(), 0, 0.8f, 0.35f, 0.6f, 1.0f);
+    FillNeuralDepth(fixture.depth.Get(), 0.5f);
+    FillMotion(fixture.motion.Get(), 0, 0.0f, 0.0f);
+    FillNeuralMask(fixture.mask.Get(), extent / 2);
+    // The after-upscale source is the backend result; it starts as its own ramp so the substitution
+    // is measurable against it.
+    FillColor(fixture.output.Get(), 0, 0.5f, 0.75f, 0.2f, 1.0f);
+
+    EvaluationRequest& request = fixture.request;
+    request.color = fixture.color.Get();
+    request.depth = fixture.depth.Get();
+    request.motion = fixture.motion.Get();
+    request.output = fixture.output.Get();
+    request.inputWidth = extent;
+    request.inputHeight = extent;
+    request.outputWidth = extent;
+    request.outputHeight = extent;
+    request.scratchWidth = extent;
+    request.scratchHeight = extent;
+    request.motionWidth = static_cast<int32_t>(extent);
+    request.motionHeight = static_cast<int32_t>(extent);
+    request.sliceCount = 1;
+    request.layout = BIGSCALE_LAYOUT_2D;
+    request.preset = Preset::Quality;
+    request.historyEpoch = 1;
+    request.motionScaleX = 1.0f;
+    request.motionScaleY = 1.0f;
+    return true;
+}
+
+BIGSCALE_NeuralConfig NeuralStageConfig(int32_t passes, int32_t timing)
+{
+    BIGSCALE_NeuralConfig config{};
+    config.abi = BIGSCALE_NEURAL_ABI_VERSION;
+    config.size = sizeof(BIGSCALE_NeuralConfig);
+    config.enabled = 1;
+    config.style = 0;
+    config.timing = timing;
+    config.passes = passes;
+    config.strength = 1.0f;
+    config.detail = 1.0f;
+    config.tone = 1.0f;
+    config.characterMask = 1;
+    return config;
+}
+
+// Counts texels whose channels differ beyond half-float storage noise.
+int CountNeuralChanges(const std::vector<float>& before, const std::vector<float>& after, UINT channels,
+    float tolerance)
+{
+    if (before.empty() || before.size() != after.size()) return 0;
+    int changed = 0;
+    for (size_t texel = 0; texel + channels <= before.size(); texel += channels)
+    {
+        for (UINT channel = 0; channel < channels; channel++)
+        {
+            if (std::fabs(before[texel + channel] - after[texel + channel]) > tolerance)
+            {
+                changed++;
+                break;
+            }
+        }
+    }
+    return changed;
+}
+
+std::string NeuralReasonSuffix(const NeuralRenderingStage& stage)
+{
+    const std::string& reason = stage.LastReason();
+    return reason.empty() ? std::string() : std::string(" (") + reason + ")";
+}
+
+// Counts changed texels in the left quarter of the image, where the mask is white: the composite
+// keeps the source pixel there, so any change means the character mask was not honoured.
+int CountNeuralMaskedChanges(const std::vector<float>& before, const std::vector<float>& after)
+{
+    constexpr UINT channels = 4;
+    if (before.empty() || before.size() != after.size()) return 0;
+    int changed = 0;
+    for (UINT y = 0; y < kNeuralExtent; y++)
+    {
+        for (UINT x = 0; x < kNeuralExtent / 4; x++)
+        {
+            const size_t at = Texel(x, y, kNeuralExtent, channels);
+            for (UINT channel = 0; channel < channels; channel++)
+            {
+                if (std::fabs(before[at + channel] - after[at + channel]) > 1e-3f)
+                {
+                    changed++;
+                    break;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+// The model must have run (the image differs) while the masked quarter stayed untouched.
+void AssertNeuralImage(const std::vector<float>& source, const std::vector<float>& image,
+    const std::string& label)
+{
+    const size_t texels = static_cast<size_t>(kNeuralExtent) * kNeuralExtent;
+    Check(image.size() == texels * 4, label + ": the neural image reads back");
+    const int changed = CountNeuralChanges(source, image, 4, 1e-3f);
+    Check(changed > 0, label + ": the model changed " + std::to_string(changed) + " of " +
+                            std::to_string(texels) + " texels");
+    const int masked = CountNeuralMaskedChanges(source, image);
+    Check(masked == 0, label + ": the masked quarter matches the source (" + std::to_string(masked) +
+                           " changed texels)");
+    std::printf("  %s: %d of %zu texels changed, %d changed under the mask\n", label.c_str(), changed,
+        texels, masked);
+}
+
+// Reads one RGBA16F stage image and asserts it differs from the image it was derived from.
+void CheckNeuralImage(ID3D11Texture2D* image, const std::vector<float>& source, const std::string& label,
+    std::vector<float>& outImage)
+{
+    if (image == nullptr)
+    {
+        Check(false, label + ": no neural image");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    image->GetDesc(&desc);
+    Check(desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Width == kNeuralExtent &&
+              desc.Height == kNeuralExtent,
+        label + ": the neural image is RGBA16F at 64x64");
+    outImage = ReadBack(image, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 4);
+    AssertNeuralImage(source, outImage, label);
+}
+
+// Runs one layer count at one timing through the real stage and returns the neural image. The first
+// call is always the creation frame: it builds the feature set and substitutes nothing.
+void RunNeuralPasses(NeuralRenderingStage& stage, int32_t passes, int32_t timing, const std::string& label,
+    std::vector<float>& outImage)
+{
+    outImage.clear();
+    NeuralFixture fixture;
+    Check(MakeNeuralFixture(fixture), label + ": fixture created");
+    if (!fixture.color || !fixture.output) return;
+
+    ViewKey key{};
+    key.cameraId = kNeuralCamera;
+    key.eye = 0;
+
+    // Before upscaling the neural answer replaces the colour input; after it, the backend result is
+    // both the model source and the substitution target.
+    ID3D11Texture2D* source = timing == 0 ? fixture.color.Get() : fixture.output.Get();
+    const std::vector<float> baseline = ReadBack(source, 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 4);
+    Check(!baseline.empty(), label + ": the source image reads back");
+
+    stage.Configure(NeuralStageConfig(passes, timing));
+
+    void* mask = fixture.mask.Get();
+    EvaluationRequest request = fixture.request;
+    if (timing == 0)
+    {
+        request.frameIndex = 1;
+        ID3D11Resource* creation = stage.BeforeUpscale(g_device.Get(), g_context.Get(), key, request, mask,
+            kNeuralExtent, kNeuralExtent);
+        Check(creation == nullptr, label + ": the creation frame returns no neural image");
+        request.frameIndex = 2;
+        ID3D11Resource* evaluated = stage.BeforeUpscale(g_device.Get(), g_context.Get(), key, request, mask,
+            kNeuralExtent, kNeuralExtent);
+        Check(evaluated != nullptr,
+            label + ": the evaluation frame returns a neural image" + NeuralReasonSuffix(stage));
+        if (evaluated != nullptr)
+            CheckNeuralImage(static_cast<ID3D11Texture2D*>(evaluated), baseline, label, outImage);
+    }
+    else
+    {
+        request.frameIndex = 1;
+        Check(stage.BeforeUpscale(g_device.Get(), g_context.Get(), key, request, mask, kNeuralExtent,
+                  kNeuralExtent) == nullptr,
+            label + ": before-upscale is inert at after-upscale timing");
+        const bool creation = stage.AfterUpscale(g_device.Get(), g_context.Get(), key, request, mask,
+            kNeuralExtent, kNeuralExtent);
+        Check(!creation, label + ": the creation frame reports no substitution");
+        request.frameIndex = 2;
+        const bool evaluated = stage.AfterUpscale(g_device.Get(), g_context.Get(), key, request, mask,
+            kNeuralExtent, kNeuralExtent);
+        Check(evaluated,
+            label + ": the evaluation frame writes the neural image" + NeuralReasonSuffix(stage));
+        if (evaluated)
+        {
+            outImage = ReadBack(fixture.output.Get(), 0, DXGI_FORMAT_R16G16B16A16_FLOAT, 4);
+            AssertNeuralImage(baseline, outImage, label);
+        }
+    }
+}
+
+// The stage resolves the compatibility runtime from the plugin directory: the provider tree first,
+// then a loose copy beside the executable. Absent is not a failure; the run reports NOT EXERCISED.
+bool NeuralRuntimeStaged(std::wstring& source)
+{
+    source.clear();
+    wchar_t modulePath[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) return false;
+    std::wstring directory(modulePath);
+    const size_t slash = directory.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    directory.resize(slash);
+    const wchar_t* candidates[2] = {L"\\providers\\dlss5\\nvngx_dlssnr.dll", L"\\nvngx_dlssnr.dll"};
+    for (const wchar_t* candidate : candidates)
+    {
+        const std::wstring path = directory + candidate;
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            source = path;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A dedicated temporary tree named BigScaleNeuralChecks-<pid> so every file the runtime writes,
+// including the nvngx.dll hard link, can be removed after the run.
+std::wstring NeuralTemporaryDirectory()
+{
+    wchar_t temporary[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, temporary) == 0) return {};
+    for (int attempt = 0; attempt < 8; attempt++)
+    {
+        wchar_t name[96]{};
+        if (attempt == 0)
+        {
+            _snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE, L"BigScaleNeuralChecks-%u",
+                GetCurrentProcessId());
+        }
+        else
+        {
+            _snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE, L"BigScaleNeuralChecks-%u-%d",
+                GetCurrentProcessId(), attempt);
+        }
+        const std::wstring path = std::wstring(temporary) + name;
+        if (CreateDirectoryW(path.c_str(), nullptr)) return path;
+        if (GetLastError() != ERROR_ALREADY_EXISTS) return {};
+    }
+    return {};
+}
+
+void CheckNeuralRendering()
+{
+    // A null, foreign-ABI or short block is refused before the bridge owns anything: no stored
+    // configuration changes and no GPU work starts.
+    Check(BIGSCALE_ConfigureNeuralRendering(nullptr) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "neural: a null configuration is refused");
+    BIGSCALE_NeuralConfig invalid{};
+    invalid.abi = 0;
+    invalid.size = sizeof(BIGSCALE_NeuralConfig);
+    Check(BIGSCALE_ConfigureNeuralRendering(&invalid) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "neural: a zero abi is refused");
+    invalid.abi = BIGSCALE_NEURAL_ABI_VERSION;
+    invalid.size = 43;
+    Check(BIGSCALE_ConfigureNeuralRendering(&invalid) == BIGSCALE_ERROR_ABI_MISMATCH,
+        "neural: a 43-byte configuration is refused");
+
+    // The bridge resolves the runtime from the executable directory; the data directory is a unique
+    // temporary tree so every file the runtime writes is removable after the run.
+    wchar_t modulePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    std::wstring runtimeDirectory(modulePath);
+    const size_t slash = runtimeDirectory.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) runtimeDirectory.resize(slash);
+
+    const std::wstring dataDirectory = NeuralTemporaryDirectory();
+    Check(!dataDirectory.empty(), "neural: the temporary data directory is created");
+    if (dataDirectory.empty()) return;
+
+    // The harness is an EXE, which cannot be loaded as a DLL. Use the bridge DLL staged beside it as
+    // the nvngx.dll forwarder unless the caller provided an explicit one.
+    {
+        wchar_t existing[MAX_PATH]{};
+        if (GetEnvironmentVariableW(L"BIGSCALE_NVNGX_FORWARDER", existing, MAX_PATH) == 0)
+        {
+            const std::wstring bridge = runtimeDirectory + L"\\BigScale.Native.dll";
+            if (GetFileAttributesW(bridge.c_str()) != INVALID_FILE_ATTRIBUTES)
+                SetEnvironmentVariableW(L"BIGSCALE_NVNGX_FORWARDER", bridge.c_str());
+        }
+    }
+
+    BIGSCALE_SetEngineVersion("6000.3.17f1");
+    Check(BIGSCALE_Initialize(runtimeDirectory.c_str(), dataDirectory.c_str()) == 1,
+        "neural: the bridge initialises");
+    // The bridge points the log manager at the application data directory. Keep the neural run's
+    // diagnostics beside the executable so a failed create can be diagnosed after the temporary
+    // tree is removed.
+    bigscale::SetLogDirectory(runtimeDirectory);
+
+    BIGSCALE_NeuralConfig disabled = NeuralStageConfig(1, 0);
+    disabled.enabled = 0;
+    Check(BIGSCALE_ConfigureNeuralRendering(&disabled) == 0, "neural: a disabled configuration is accepted");
+    Check(ReadStatus().neuralState == BIGSCALE_NEURAL_OFF, "neural: a disabled configuration reports Off");
+
+    const BIGSCALE_NeuralConfig enabled = NeuralStageConfig(1, 0);
+    Check(BIGSCALE_ConfigureNeuralRendering(&enabled) == 0,
+        "neural: a valid enabled configuration is accepted");
+
+    std::wstring runtimePath;
+    const bool runtimePresent = NeuralRuntimeStaged(runtimePath);
+    const BIGSCALE_Status afterConfigure = ReadStatus();
+    if (runtimePresent)
+    {
+        Check(afterConfigure.neuralState == BIGSCALE_NEURAL_WAITING,
+            "neural: an enabled configuration reports Waiting until it evaluates");
+    }
+    else
+    {
+        Check(afterConfigure.neuralState == BIGSCALE_NEURAL_RUNTIME_MISSING,
+            "neural: a missing runtime reports Runtime missing");
+    }
+
+    if (runtimePresent)
+    {
+        std::printf("neural runtime: %ls\n", runtimePath.c_str());
+        {
+            NeuralRenderingStage stage;
+            stage.SetEnvironment(runtimeDirectory, dataDirectory, "6000.3.17f1");
+            // A generation change (pass count, then timing) rebuilds the feature set, so each run
+            // starts with its own creation frame.
+            std::vector<float> onePass;
+            RunNeuralPasses(stage, 1, 0, "neural before-upscaling 1 pass", onePass);
+            std::vector<float> fivePasses;
+            RunNeuralPasses(stage, 5, 0, "neural before-upscaling 5 passes", fivePasses);
+            if (!onePass.empty() && !fivePasses.empty())
+            {
+                const int changed = CountNeuralChanges(onePass, fivePasses, 4, 1e-3f);
+                Check(changed > 0, "neural: the five-pass image differs from the one-pass image (" +
+                                       std::to_string(changed) + " texels)");
+                std::printf("  neural multipass: %d of %zu texels differ between 1 and 5 passes\n", changed,
+                    onePass.size() / 4);
+            }
+            std::vector<float> afterUpscaling;
+            RunNeuralPasses(stage, 1, 1, "neural after-upscaling 1 pass", afterUpscaling);
+            stage.Release();
+        }
+    }
+    else
+    {
+        std::printf("neural runtime: NOT EXERCISED "
+                    "(stage nvngx_dlssnr.dll next to BigScaleChecks.exe)\n");
+    }
+
+    // No file this run produced may survive it: the alias is a hard link into the compatibility
+    // runtime, and the application data tree holds whatever the NGX core wrote. The bridge's log
+    // file lives in that tree, so re-point the log manager at the executable directory first; an
+    // open handle would make the directory removal fail on every retry.
+    bigscale::SetLogDirectory(runtimeDirectory);
+    const std::wstring alias = dataDirectory + L"\\dlss5\\nvngx.dll";
+    DeleteFileW(alias.c_str());
+    Check(GetFileAttributesW(alias.c_str()) == INVALID_FILE_ATTRIBUTES,
+        "neural: the nvngx.dll alias is removed");
+    // NGX flushes its application-data logs asynchronously; a bounded window keeps a late flush from
+    // being reported as a leak while the final state is still asserted.
+    for (int attempt = 0; attempt < 20 &&
+        GetFileAttributesW(dataDirectory.c_str()) != INVALID_FILE_ATTRIBUTES; attempt++)
+    {
+        RemoveTree(dataDirectory);
+        Sleep(50);
+    }
+    Check(GetFileAttributesW(dataDirectory.c_str()) == INVALID_FILE_ATTRIBUTES,
+        "neural: the temporary data directory is removed");
+}
+
 std::vector<std::wstring> ListProbeFiles(const std::wstring& directory)
 {
     std::vector<std::wstring> files;
@@ -2836,6 +3453,9 @@ void CheckStageProbeBilinear()
 bool g_fgAll = false;
 // Set for `--fg anr`: the ANR process family. Every other provider must be refused in-process.
 bool g_fgAnr = false;
+// Set by `--anr-after-normal`: this process exercises the one-way normal -> ANR migration and the
+// restart-required back-switch after the incumbent normal provider has run the whole suite.
+bool g_fgAnrAfterNormal = false;
 // Set by `--source-blt`: creates the game/source swapchain as one-buffer bitblt instead of the
 // fixture's historic two-buffer flip chain. Provider-owned child swapchains are never altered.
 bool g_fgSourceBlt = false;
@@ -4171,8 +4791,24 @@ void PrintImageMap(const Image& image)
     }
 }
 
-// Runs `--fg anr` in a child process so the ANR family never loads into the parent harness.
-bool RunAnrChildProcess(int& exitCode, std::string& reason)
+// True when this build staged the ANR runtime beside the check executable, i.e. the same
+// `providers\anr\nvngx_dlssg.dll` path the provider preflight inspects.
+bool AnrRuntimeStaged()
+{
+    wchar_t modulePath[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0) return false;
+    std::wstring path(modulePath);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    path.resize(slash);
+    path += L"\\providers\\anr\\nvngx_dlssg.dll";
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Runs `--fg anr` in a child process so the ANR family never loads into the parent harness. The
+// `afterNormal` variant first runs `--fg fsr`'s suite in that child and then migrates to ANR.
+bool RunAnrChildProcess(bool afterNormal, int& exitCode, std::string& reason)
 {
     wchar_t modulePath[MAX_PATH]{};
     if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH) == 0)
@@ -4182,7 +4818,9 @@ bool RunAnrChildProcess(int& exitCode, std::string& reason)
     }
     std::wstring command = L"\"";
     command += modulePath;
-    command += L"\" --fg anr --fg-multiplier ";
+    command += L"\" ";
+    command += afterNormal ? L"--fg fsr --anr-after-normal" : L"--fg anr";
+    command += L" --fg-multiplier ";
     command += std::to_wstring(g_fgMultiplier);
     if (g_fgSourceBlt) command += L" --source-blt";
     if (g_fgSourceGame) command += L" --source-game";
@@ -4193,11 +4831,18 @@ bool RunAnrChildProcess(int& exitCode, std::string& reason)
     // directory so running the checks never writes into the repository.
     wchar_t tempDirectory[MAX_PATH]{};
     const DWORD tempLength = GetTempPathW(MAX_PATH, tempDirectory);
+    const wchar_t* childLogName = afterNormal ? L"bigscale-fg-anr-after-normal-child.log"
+                                              : L"bigscale-fg-anr-child.log";
     std::wstring childLogPath = tempLength > 0 && tempLength < MAX_PATH
-        ? std::wstring(tempDirectory) + L"bigscale-fg-anr-child.log"
-        : std::wstring(L"bigscale-fg-anr-child.log");
+        ? std::wstring(tempDirectory) + childLogName
+        : std::wstring(childLogName);
+    // The child inherits this handle as its stdout/stderr, so it must be created inheritable;
+    // CreateProcessW is called with bInheritHandles=TRUE below.
+    SECURITY_ATTRIBUTES inheritable{};
+    inheritable.nLength = sizeof(inheritable);
+    inheritable.bInheritHandle = TRUE;
     HANDLE childLog = CreateFileW(childLogPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (childLog != INVALID_HANDLE_VALUE)
     {
         startup.dwFlags = STARTF_USESTDHANDLES;
@@ -4458,13 +5103,17 @@ void CheckFrameGeneration(const char* label, int32_t provider)
     Check(BIGSCALE_FG_SetPresenterVisible(1) == 1,
         std::string(label) + ": the presenter is shown from the window's owning thread");
     SetFgTestObserver(FrameGenerationObserver);
+    // Pin the display refresh so the adaptive cadence governor makes the same decision on any host
+    // monitor. The fixture below paces the source at M * 60 Hz, so the governor must settle at M;
+    // without the pin a 30 Hz or 144 Hz host would measure a different fit.
+    FgTestSetDisplayRefreshMilliseconds(1000.0 / 60.0);
 
     using RenderEventFn = void (*)(int32_t, void*);
     const auto renderEvent = reinterpret_cast<RenderEventFn>(BIGSCALE_FG_GetRenderEvent());
     Check(renderEvent != nullptr, std::string(label) + ": the FG render event is exported");
 
     const bool needsHudless = provider == BIGSCALE_FG_PROVIDER_NVIDIA || provider == BIGSCALE_FG_PROVIDER_FSR ||
-        provider == BIGSCALE_FG_PROVIDER_ANR;
+        provider == BIGSCALE_FG_PROVIDER_ANR || g_fgAnrAfterNormal;
     // The fixture must be physically presentable: M images per source need M presents inside one
     // source interval, and no compositor presents faster than its refresh. At 2x the historical
     // 30 Hz source yields 60 presents/s; above 2x the source slows so each step remains one 60 Hz
@@ -4505,6 +5154,9 @@ void CheckFrameGeneration(const char* label, int32_t provider)
         TIMER_ALL_ACCESS);
     if (sourceTimer == nullptr) sourceTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     double lastSourceSubmitMs = 0.0;
+    // Absolute schedule for the simulated source. Advanced once per presented frame so the interval
+    // stays fixed no matter how fast or slow the transport is.
+    double nextSourceSlotMs = 0.0;
     auto waitForSourceSlot = [&](double targetMilliseconds)
     {
         for (int iteration = 0; iteration < 4; iteration++)
@@ -4534,10 +5186,19 @@ void CheckFrameGeneration(const char* label, int32_t provider)
                             float jitterX, float jitterY) -> bool
     {
         // The source runs at 30 Hz: a 30-to-60 doubling only has a half-period to fill if the source
-        // itself is paced.
+        // itself is paced. The schedule is absolute, not "last submit + interval": a relative pacer
+        // measures its own loop speed, so a fast transport would speed the simulated source up and a
+        // governor that gates on the source interval would then correctly refuse to generate. A real
+        // game's frame rate is its own, so the fixture holds the interval fixed.
         LARGE_INTEGER waitStart{};
         QueryPerformanceCounter(&waitStart);
-        waitForSourceSlot(lastSourceSubmitMs + kSourceIntervalMilliseconds);
+        nextSourceSlotMs += kSourceIntervalMilliseconds;
+        // A slowed frame (provider initialisation, a resize) leaves the schedule behind. Catching up
+        // by presenting several frames back to back would simulate a far faster source than this
+        // fixture models, so the schedule resyncs to one interval after the last present instead.
+        if (nextSourceSlotMs < lastSourceSubmitMs)
+            nextSourceSlotMs = lastSourceSubmitMs + kSourceIntervalMilliseconds;
+        waitForSourceSlot(nextSourceSlotMs);
         LARGE_INTEGER waitEnd{};
         QueryPerformanceCounter(&waitEnd);
         if (g_traceSlowWaits && QpcMilliseconds(waitEnd.QuadPart - waitStart.QuadPart) > 100.0)
@@ -4854,6 +5515,7 @@ void CheckFrameGeneration(const char* label, int32_t provider)
                 std::string(label) + ": a capability refusal is not a restart requirement");
             BIGSCALE_FG_Shutdown();
             SetFgTestObserver(nullptr);
+            FgTestSetDisplayRefreshMilliseconds(0.0);
             DestroyWindow(window);
             return;
         }
@@ -4864,6 +5526,7 @@ void CheckFrameGeneration(const char* label, int32_t provider)
                              ceilingReason + ")");
             BIGSCALE_FG_Shutdown();
             SetFgTestObserver(nullptr);
+            FgTestSetDisplayRefreshMilliseconds(0.0);
             DestroyWindow(window);
             return;
         }
@@ -4971,6 +5634,7 @@ void CheckFrameGeneration(const char* label, int32_t provider)
         WaitWithMessages(nullptr, 1000);
         BIGSCALE_FG_Shutdown();
         SetFgTestObserver(nullptr);
+        FgTestSetDisplayRefreshMilliseconds(0.0);
         DestroyWindow(window);
         return;
     }
@@ -5765,6 +6429,7 @@ void CheckFrameGeneration(const char* label, int32_t provider)
         WaitWithMessages(nullptr, 1000);
         BIGSCALE_FG_Shutdown();
         SetFgTestObserver(nullptr);
+        FgTestSetDisplayRefreshMilliseconds(0.0);
         BIGSCALE_FG_GetStatus(&status);
         Check(status.state == BIGSCALE_FG_STATE_OFF, "probe shutdown returns FG to Off");
         DestroyWindow(window);
@@ -6042,82 +6707,76 @@ void CheckFrameGeneration(const char* label, int32_t provider)
                                 std::string(names[(round + 1) % 3]));
             if (!recovered) break;
         }
-        // ANR cannot be loaded into this process: the family boundary must refuse it with the exact
-        // restart reason, keep the selection and stop presenting generated frames.
-        const uint64_t generation = ++config.generation;
-        BIGSCALE_FG_Config anr = config;
-        anr.provider = BIGSCALE_FG_PROVIDER_ANR;
-        anr.generation = generation;
-        Check(BIGSCALE_FG_Configure(&anr) == 1, std::string(label) + ": the ANR request is accepted");
-        BIGSCALE_FG_Status beforeAnr{};
-        BIGSCALE_FG_GetStatus(&beforeAnr);
-        Check(beforeAnr.processFamily == BIGSCALE_FG_FAMILY_NORMAL,
-            std::string(label) + ": the claimed normal family is published before any ANR capture");
-        int anrFailures = 0;
-        for (int i = 0; i < 12; i++)
+        // ANR installs process-wide hooks, so the parent never requests it while the runtime is
+        // staged: the one-way migration runs in its own child. Without the runtime the preflight
+        // must refuse it without destroying the normal provider that already owns the process.
+        if (AnrRuntimeStaged())
         {
-            if (presentFrame(generation, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f)) continue;
-            // Once the refusal is published, presentFrame short-circuits; only a failure before that
-            // is a transport defect.
-            BIGSCALE_FG_Status probe{};
-            BIGSCALE_FG_GetStatus(&probe);
-            if (probe.state != BIGSCALE_FG_STATE_UNSUPPORTED) anrFailures++;
+            std::printf("%s: normal->ANR migration is exercised in the --anr-after-normal child\n", label);
         }
-        Sleep(400);
-        BIGSCALE_FG_Status refused{};
-        BIGSCALE_FG_GetStatus(&refused);
-        std::printf("%s: ANR-in-normal-family state=%d provider=%d reason=%s\n", label, refused.state,
-            refused.activeProvider, refused.reason);
-        Check(anrFailures == 0, std::string(label) + ": the parent process survives the ANR request");
-        Check(refused.activeProvider == BIGSCALE_FG_PROVIDER_OFF,
-            std::string(label) + ": no provider becomes active after the refused ANR request");
-        Check(std::string(refused.reason) ==
-                  "restart the game to switch between ANR and other frame-generation providers",
-            std::string(label) + ": the ANR refusal names the restart requirement (got: " +
-                std::string(refused.reason) + ")");
-        Check(refused.generatedPresents == beforeAnr.generatedPresents,
-            std::string(label) + ": no generated frame is published for the refused ANR request");
-        Check(refused.requestedProvider == BIGSCALE_FG_PROVIDER_ANR,
-            std::string(label) + ": the refused ANR selection is kept for the next start");
-        Check(refused.restartRequired == 1,
-            std::string(label) + ": the family refusal carries the typed restart requirement");
-        Check(refused.processFamily == BIGSCALE_FG_FAMILY_NORMAL,
-            std::string(label) + ": the refused ANR request reports the normal family it found");
-        // Opening the settings menu suspends generation but must not erase the typed requirement:
-        // it belongs to the same provider/generation refusal identity.
+        else
         {
-            // Same provider/generation: the refusal identity is unchanged, so the typed restart
-            // requirement must survive the menu suspension instead of being cleared by it.
-            BIGSCALE_FG_Config menu = anr;
-            menu.menuVisible = 1;
-            Check(BIGSCALE_FG_Configure(&menu) == 1, std::string(label) + ": the menu-suspended refusal is accepted");
-            BIGSCALE_FG_Status suspended{};
-            BIGSCALE_FG_GetStatus(&suspended);
-            Check(suspended.requestedProvider == BIGSCALE_FG_PROVIDER_ANR,
-                std::string(label) + ": the refused selection survives menu suspension");
-            Check(suspended.restartRequired == 1,
-                std::string(label) + ": the restart requirement survives menu suspension");
-            menu.menuVisible = 0;
-            Check(BIGSCALE_FG_Configure(&menu) == 1,
-                std::string(label) + ": closing the menu keeps the refused identity");
-        }
-        // The selection survives for the next start; an allowed provider resumes in this process and
-        // its compatible configuration clears the restart requirement.
-        config.provider = BIGSCALE_FG_PROVIDER_XESS;
-        config.generation = ++config.generation;
-        Check(BIGSCALE_FG_Configure(&config) == 1,
-            std::string(label) + ": the compatible XeSS reselection is configured");
-        // The first accepted frame after a refusal is a history reset and cannot generate; the
-        // following frames must prove the compatible reselection genuinely works.
-        for (int i = 0; i < 16; i++)
-            presentFrame(config.generation, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f);
-        Check(waitForActive(config.generation, config.provider, beforeAnr.generatedPresents, 8000),
-            std::string(label) + ": an allowed provider resumes after the ANR refusal");
-        {
-            BIGSCALE_FG_Status cleared{};
-            BIGSCALE_FG_GetStatus(&cleared);
-            Check(cleared.restartRequired == 0,
-                std::string(label) + ": a compatible reselection clears the restart requirement");
+            const uint64_t generation = ++config.generation;
+            BIGSCALE_FG_Config anr = config;
+            anr.provider = BIGSCALE_FG_PROVIDER_ANR;
+            anr.generation = generation;
+            Check(BIGSCALE_FG_Configure(&anr) == 1, std::string(label) + ": the ANR request is accepted");
+            BIGSCALE_FG_Status beforeAnr{};
+            BIGSCALE_FG_GetStatus(&beforeAnr);
+            Check(beforeAnr.processFamily == BIGSCALE_FG_FAMILY_NORMAL,
+                std::string(label) + ": the claimed normal family is published before any ANR capture");
+            int anrFailures = 0;
+            for (int i = 0; i < 12; i++)
+            {
+                if (presentFrame(generation, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f)) continue;
+                // Once the refusal is published, presentFrame short-circuits; only a failure before
+                // that is a transport defect.
+                BIGSCALE_FG_Status probe{};
+                BIGSCALE_FG_GetStatus(&probe);
+                if (probe.state != BIGSCALE_FG_STATE_UNSUPPORTED) anrFailures++;
+            }
+            Sleep(400);
+            BIGSCALE_FG_Status refused{};
+            BIGSCALE_FG_GetStatus(&refused);
+            std::printf("%s: ANR-missing-runtime state=%d provider=%d family=%u reason=%s\n", label,
+                refused.state, refused.activeProvider, refused.processFamily, refused.reason);
+            Check(anrFailures == 0, std::string(label) + ": the parent process survives the ANR request");
+            Check(refused.state == BIGSCALE_FG_STATE_UNSUPPORTED,
+                std::string(label) + ": a missing ANR runtime reports Unsupported");
+            Check(refused.activeProvider == BIGSCALE_FG_PROVIDER_OFF,
+                std::string(label) + ": no provider becomes active after the refused ANR request");
+            Check(refused.requestedProvider == BIGSCALE_FG_PROVIDER_ANR,
+                std::string(label) + ": the refused ANR selection is kept for the next start");
+            Check(refused.restartRequired == 0,
+                std::string(label) + ": a missing ANR runtime needs no restart");
+            Check(refused.processFamily == BIGSCALE_FG_FAMILY_NORMAL,
+                std::string(label) + ": a missing ANR runtime does not claim the ANR family");
+            // The preflight runs before the incumbent is destroyed, so the reason is either the
+            // missing runtime (HAGS enabled) or the HAGS prerequisite its check precedes.
+            const std::string missingReason =
+                "ANR FG runtime is missing; check the mod page for how to install ANR";
+            const bool hagsReason =
+                std::string(refused.reason).find("hardware-accelerated GPU scheduling") != std::string::npos;
+            Check(std::string(refused.reason) == missingReason || hagsReason,
+                std::string(label) + ": the ANR preflight names the missing prerequisite (got: " +
+                    std::string(refused.reason) + ")");
+            Check(refused.generatedPresents == beforeAnr.generatedPresents,
+                std::string(label) + ": no generated frame is published for the refused ANR request");
+            // The incumbent normal provider must still own the process.
+            config.provider = BIGSCALE_FG_PROVIDER_XESS;
+            config.generation = ++config.generation;
+            Check(BIGSCALE_FG_Configure(&config) == 1,
+                std::string(label) + ": the compatible XeSS reselection is configured");
+            for (int i = 0; i < 16; i++)
+                presentFrame(config.generation, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f);
+            Check(waitForActive(config.generation, BIGSCALE_FG_PROVIDER_XESS, beforeAnr.generatedPresents, 8000),
+                std::string(label) + ": an allowed provider resumes after the missing ANR runtime");
+            {
+                BIGSCALE_FG_Status cleared{};
+                BIGSCALE_FG_GetStatus(&cleared);
+                Check(cleared.restartRequired == 0,
+                    std::string(label) + ": a compatible reselection keeps restartRequired clear");
+            }
         }
         config.provider = BIGSCALE_FG_PROVIDER_FSR;
     }
@@ -6234,6 +6893,125 @@ void CheckFrameGeneration(const char* label, int32_t provider)
             std::string(label) + ": ANR recovers after a resize");
     }
 
+    if (g_fgAnrAfterNormal)
+    {
+        // The incumbent normal provider ran the whole suite in this process. ANR must now migrate
+        // the family in place, and the way back must stay a typed restart requirement.
+        BIGSCALE_FG_Status beforeMigration{};
+        BIGSCALE_FG_GetStatus(&beforeMigration);
+        Check(beforeMigration.processFamily == BIGSCALE_FG_FAMILY_NORMAL,
+            std::string(label) + ": the incumbent normal provider owns the process family");
+        Check(beforeMigration.activeProvider == provider,
+            std::string(label) + ": the incumbent normal provider is active before the ANR request");
+        Check(beforeMigration.restartRequired == 0,
+            std::string(label) + ": the incumbent normal provider needs no restart");
+
+        const uint64_t anrGeneration = ++config.generation;
+        config.provider = BIGSCALE_FG_PROVIDER_ANR;
+        config.generation = anrGeneration;
+        Check(BIGSCALE_FG_Configure(&config) == 1,
+            std::string(label) + ": the ANR selection after a normal provider is accepted");
+        BIGSCALE_FG_Status beforeAnr{};
+        BIGSCALE_FG_GetStatus(&beforeAnr);
+        for (int i = 0; i < 16; i++)
+            presentFrame(anrGeneration, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f);
+        const bool anrActive = waitForActive(anrGeneration, BIGSCALE_FG_PROVIDER_ANR,
+            beforeAnr.generatedPresents, 8000);
+        Check(anrActive, std::string(label) + ": ANR becomes active in place after a normal provider");
+        BIGSCALE_FG_Status migrated{};
+        BIGSCALE_FG_GetStatus(&migrated);
+        std::printf("%s: normal->ANR state=%d provider=%d family=%u restart=%u generated=%llu reason=%s\n",
+            label, migrated.state, migrated.activeProvider, migrated.processFamily, migrated.restartRequired,
+            static_cast<unsigned long long>(migrated.generatedPresents), migrated.reason);
+        Check(migrated.processFamily == BIGSCALE_FG_FAMILY_ANR,
+            std::string(label) + ": the one-way migration publishes the ANR family");
+        Check(migrated.activeProvider == BIGSCALE_FG_PROVIDER_ANR,
+            std::string(label) + ": ANR is the active provider after the in-place migration");
+        Check(migrated.restartRequired == 0,
+            std::string(label) + ": the normal->ANR migration needs no restart");
+        Check(migrated.generatedPresents > beforeAnr.generatedPresents,
+            std::string(label) + ": the migrated ANR family generates frames");
+
+        // The reverse direction is a one-way door: ANR keeps its hooks installed, so the normal
+        // provider is refused with the exact restart reason and the ANR family is kept.
+        const uint64_t backGeneration = ++config.generation;
+        config.provider = provider;
+        config.generation = backGeneration;
+        Check(BIGSCALE_FG_Configure(&config) == 1,
+            std::string(label) + ": the normal provider request from the ANR family is accepted");
+        int backFailures = 0;
+        for (int i = 0; i < 12; i++)
+        {
+            if (presentFrame(backGeneration, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f)) continue;
+            // Once the refusal is published, presentFrame short-circuits; only a failure before that
+            // is a transport defect.
+            BIGSCALE_FG_Status probe{};
+            BIGSCALE_FG_GetStatus(&probe);
+            if (probe.state != BIGSCALE_FG_STATE_UNSUPPORTED) backFailures++;
+        }
+        Sleep(300);
+        BIGSCALE_FG_Status refused{};
+        BIGSCALE_FG_GetStatus(&refused);
+        std::printf("%s: normal-in-ANR-family state=%d provider=%d family=%u restart=%u reason=%s\n", label,
+            refused.state, refused.activeProvider, refused.processFamily, refused.restartRequired,
+            refused.reason);
+        Check(backFailures == 0, std::string(label) + ": the process survives the normal request from ANR");
+        Check(refused.state == BIGSCALE_FG_STATE_UNSUPPORTED,
+            std::string(label) + ": the normal request from the ANR family reports Unsupported");
+        Check(refused.activeProvider == BIGSCALE_FG_PROVIDER_OFF,
+            std::string(label) + ": no provider becomes active after the refused normal request");
+        Check(refused.restartRequired == 1,
+            std::string(label) + ": the ANR -> normal request carries the typed restart requirement");
+        Check(refused.processFamily == BIGSCALE_FG_FAMILY_ANR,
+            std::string(label) + ": the ANR family is kept after the refused normal request");
+        Check(std::string(refused.reason) ==
+                  "restart the game to switch between ANR and other frame-generation providers",
+            std::string(label) + ": the ANR -> normal refusal names the restart requirement (got: " +
+                std::string(refused.reason) + ")");
+        Check(refused.generatedPresents == migrated.generatedPresents,
+            std::string(label) + ": no generated frame is published for the refused normal request");
+        // Opening the settings menu suspends generation but must not erase the typed requirement:
+        // it belongs to the same provider/generation refusal identity.
+        {
+            BIGSCALE_FG_Config menu = config;
+            menu.menuVisible = 1;
+            Check(BIGSCALE_FG_Configure(&menu) == 1,
+                std::string(label) + ": the menu-suspended ANR -> normal refusal is accepted");
+            BIGSCALE_FG_Status suspended{};
+            BIGSCALE_FG_GetStatus(&suspended);
+            Check(suspended.requestedProvider == provider,
+                std::string(label) + ": the refused normal selection survives menu suspension");
+            Check(suspended.restartRequired == 1,
+                std::string(label) + ": the restart requirement survives menu suspension");
+            menu.menuVisible = 0;
+            Check(BIGSCALE_FG_Configure(&menu) == 1,
+                std::string(label) + ": closing the menu keeps the refused identity");
+        }
+
+        // ANR must still be selectable after the refusal, and the family never leaves ANR.
+        const uint64_t recoveryGeneration = ++config.generation;
+        config.provider = BIGSCALE_FG_PROVIDER_ANR;
+        config.generation = recoveryGeneration;
+        Check(BIGSCALE_FG_Configure(&config) == 1,
+            std::string(label) + ": ANR is re-selected after the refused normal request");
+        BIGSCALE_FG_Status recoveryBefore{};
+        BIGSCALE_FG_GetStatus(&recoveryBefore);
+        for (int i = 0; i < 16; i++)
+            presentFrame(recoveryGeneration, i == 0, -1, static_cast<int>(kObjectY), true, 0.0f, 0.0f);
+        Check(waitForActive(recoveryGeneration, BIGSCALE_FG_PROVIDER_ANR, recoveryBefore.generatedPresents,
+                  8000),
+            std::string(label) + ": ANR recovers after the refused normal request");
+        {
+            BIGSCALE_FG_Status recovered{};
+            BIGSCALE_FG_GetStatus(&recovered);
+            Check(recovered.restartRequired == 0,
+                std::string(label) + ": re-selecting ANR clears the restart requirement");
+            Check(recovered.processFamily == BIGSCALE_FG_FAMILY_ANR,
+                std::string(label) + ": the ANR family is still owned after the recovery");
+        }
+        // `config` already names ANR at the recovery generation, so the shared teardown turns it Off.
+    }
+
     std::printf("%s: phase teardown\n", label);
     // Off must return to Off and stop presenting.
     BIGSCALE_FG_Config off = config;
@@ -6248,6 +7026,9 @@ void CheckFrameGeneration(const char* label, int32_t provider)
     // The observer stays registered until the worker has stopped, so a late provider call can never
     // reach a pointer the harness already dropped.
     SetFgTestObserver(nullptr);
+    // The provider has stopped, so the pinned refresh no longer governs anything: restore the real
+    // display for anything that presents after this check.
+    FgTestSetDisplayRefreshMilliseconds(0.0);
     BIGSCALE_FG_GetStatus(&status);
     Check(status.state == BIGSCALE_FG_STATE_OFF, "shutdown returns FG to Off");
     DestroyWindow(window);
@@ -6709,6 +7490,14 @@ int main(int argc, char** argv)
         std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);
         return g_failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && std::string(argv[1]) == "--neural")
+    {
+        // Focused run: the neural runtime is user-supplied and large, and its create/evaluate proof
+        // is independent of the conversion and provider checks that follow.
+        CheckNeuralRendering();
+        std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);
+        return g_failures == 0 ? 0 : 1;
+    }
     // First, on a pristine device and context: the conversion contract needs neither the bridge nor
     // any earlier check's pipeline state.
     CheckFrameGenerationColorExtents();
@@ -6726,6 +7515,7 @@ int main(int argc, char** argv)
     CheckComputeSlotState();
     CheckRejections(eyes);
     CheckAbi();
+    CheckFgAdaptiveCadence();
     CheckStageProbeBilinear();
     CheckRingAndProbe();
     CheckRetirementGating();
@@ -6803,6 +7593,7 @@ int main(int argc, char** argv)
                 g_fgSourceGame = true;
             }
             else if (option == "--fg-probe") g_fgProbe = true;
+            else if (option == "--anr-after-normal") g_fgAnrAfterNormal = true;
             else if (option == "--fg-multiplier")
             {
                 if (index + 1 >= argc)
@@ -6841,6 +7632,14 @@ int main(int argc, char** argv)
             std::printf("--fg all --fg-probe is not a supported combination\n");
             return 2;
         }
+        const bool normalProvider = fgProvider == BIGSCALE_FG_PROVIDER_NVIDIA ||
+            fgProvider == BIGSCALE_FG_PROVIDER_FSR || fgProvider == BIGSCALE_FG_PROVIDER_XESS;
+        if (g_fgAnrAfterNormal && (!normalProvider || g_fgAll || g_fgAnr || g_fgProbe))
+        {
+            std::printf("--anr-after-normal requires --fg <nvidia|fsr|xess> and cannot use --fg all, "
+                        "--fg anr or --fg-probe\n");
+            return 2;
+        }
     }
     // The SR bridge checks may have re-pointed the native log; restore it so provider transitions
     // from the FG harness are diagnosable in build/native/Release/native.log.
@@ -6865,11 +7664,24 @@ int main(int argc, char** argv)
     {
         // ANR installs process-wide D3D12 hooks, so its family is exercised in its own process and
         // must never load into this one. A failing child is a failure, not "unsupported".
-        int exitCode = -1;
-        std::string childReason;
-        const bool childOk = RunAnrChildProcess(exitCode, childReason);
-        Check(childOk, "the ANR family process completed its checks (" +
-                           (childOk ? std::string("exit 0") : childReason) + ")");
+        if (AnrRuntimeStaged())
+        {
+            int exitCode = -1;
+            std::string childReason;
+            const bool anrFirstOk = RunAnrChildProcess(false, exitCode, childReason);
+            Check(anrFirstOk, "the ANR family process completed its checks (" +
+                                  (anrFirstOk ? std::string("exit 0") : childReason) + ")");
+            exitCode = -1;
+            childReason.clear();
+            const bool afterNormalOk = RunAnrChildProcess(true, exitCode, childReason);
+            Check(afterNormalOk, "the normal->ANR family process completed its checks (" +
+                                     (afterNormalOk ? std::string("exit 0") : childReason) + ")");
+        }
+        else
+        {
+            std::printf("ANR family processes: NOT EXERCISED "
+                        "(providers/anr/nvngx_dlssg.dll is not staged)\n");
+        }
     }
 
     std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);

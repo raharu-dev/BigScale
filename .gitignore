@@ -1,3 +1,6 @@
+# Directory used to temporarily store things used for research and development
+.research/
+
 # Generated build and release output
 /build/
 /dist/
@@ -9,8 +12,7 @@
 **/bin/
 **/obj/
 
-# Root scratch objects and logs
-/*.obj
+# Scratch logs and probes
 *.log
 /.write-probe
 
@@ -22,3 +24,27 @@ __pycache__/
 /.vs/
 *.user
 *.suo
+
+# Archives and downloaded SDK bundles
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# Windows binaries and debug artifacts
+*.dll
+*.exe
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.dmp
+*.rdc
+*.bmp
+
+# OS metadata
+Thumbs.db
+.DS_Store

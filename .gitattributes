@@ -1,0 +1,29 @@
+# Store text with LF in the repository; check out PowerShell scripts with CRLF for Windows.
+* text=auto
+*.ps1 text eol=crlf
+*.cs text
+*.cpp text
+*.h text
+*.hpp text
+*.hlsl text
+*.inl text
+*.cmake text
+CMakeLists.txt text
+*.md text
+*.txt text
+*.json text
+*.yml text
+*.yaml text
+*.def text
+*.py text
+
+# Binaries
+*.dll binary
+*.exe binary
+*.lib binary
+*.obj binary
+*.pdb binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.png binary

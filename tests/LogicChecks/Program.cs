@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 using BigScale;
@@ -20,7 +21,6 @@ internal static class Program
         CheckStatusFormatting();
         CheckHistory();
         CheckFramePolicy();
-        CheckMenuSession();
         CheckPresentationExtent();
         CheckTemporalInputPolicy();
         CheckXrJitter();
@@ -29,12 +29,16 @@ internal static class Program
         CheckSettingsPanelSchema();
         CheckVrMode();
         CheckHudTelemetry();
+        CheckHudPlacement();
         CheckPrimaryCameraPolicy();
         CheckFrameGenerationActivity();
+        CheckFrameGenerationFamily();
         CheckFrameMultiplierCeiling();
         CheckCategoryColumnLayout();
         CheckTransition();
         CheckViewIdentity();
+        CheckNeuralRendering();
+        CheckCharacterMaskPolicy();
         CheckAbi();
         CheckBridge(args);
         Console.WriteLine(_failures == 0 ? "ALL CHECKS PASSED" : $"{_failures} CHECK(S) FAILED");
@@ -263,12 +267,21 @@ internal static class Program
         Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgSuspended, FrameGenerationKind.Fsr, 2,
                   "VR\nlocked") == "FG: AMD FSR - 2x - Suspended: VR locked",
             "a suspended row keeps its reason on one line");
+        // A cadence pause presents the game's real frame only, so the row must say 1x, not the request.
+        Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgSuspended, FrameGenerationKind.Nvidia, 1,
+                  "source framerate too high for this display") ==
+              "FG: NVIDIA - 1x - Suspended: source framerate too high for this display",
+            "a cadence pause reports the presented 1x with its reason");
         Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgOff, FrameGenerationKind.Fsr, 5, "") ==
               "FG: Off - 1x - Off", "FG Off never prints a remembered provider or multiplier");
         Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgVrDisabled, FrameGenerationKind.Off, 1, "") ==
               "FG: Off - 1x - Disabled in VR", "VR reports the locked Off state");
         Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgRestart, FrameGenerationKind.Anr, 2, "") ==
               "FG: ANR - 2x - Restart required", "the restart requirement is its own state");
+        Check(UpscalingStatus.FrameGeneration(UpscalingStatus.FgUnsupported, FrameGenerationKind.Anr, 2,
+                  "ANR FG runtime is missing; check the mod page for how to install ANR") ==
+              "FG: ANR - 2x - Unsupported: ANR FG runtime is missing; check the mod page for how to install ANR",
+            "the ANR missing-runtime warning is shown verbatim");
     }
 
     private static void CheckHistory()
@@ -407,74 +420,6 @@ internal static class Program
         Check(!FramePolicy.WritesOutput(FramePolicy.Probe), "a probe never writes the output");
     }
 
-    private static void CheckMenuSession()
-    {
-        // Delete before the settings screen is ready: the request is kept, then resolved.
-        var session = new MenuSession();
-        session.BeginOpenFromGameplay(10, 77, true);
-        session.PauseOpened();
-        session.RequestPending(10);
-        Check(session.ShouldResolve(10, out _), "a pending open resolves while it is recent");
-        Check(session.ShouldResolve(10 + MenuSession.PendingFrameLimit, out _),
-            "a pending open still resolves at the frame limit");
-        Check(!session.ShouldResolve(11 + MenuSession.PendingFrameLimit, out var expired) && expired,
-            "a pending open expires past the limit");
-        Check(!session.PendingShow, "an expired pending open is dropped");
-
-        // A normal gameplay close owns the pause menu and the previous category.
-        var close = new MenuSession();
-        close.BeginOpenFromGameplay(0, 77, true);
-        close.PauseOpened();
-        close.RequestPending(0);
-        close.PendingResolved();
-        var plan = close.BeginClose();
-        Check(plan.OpenedPause, "a gameplay open plans to close the pause menu");
-        Check(!plan.SwitchOnly, "a gameplay open is not a switch-only close");
-        Check(plan.PreviousCategoryToken == 77 && plan.HadPreviousSelection,
-            "the close keeps the previous category and selection");
-
-        // The stock Back action disables the screen mid-close: the plan must survive.
-        Check(!close.ScreenDisabled(), "a disable notification during a close is ignored");
-        Check(close.IsClosing, "the close stays in progress");
-        close.EndClose();
-        Check(close.ScreenDisabled(), "a disable notification after the close is accepted");
-
-        // A player-opened settings screen is not closed.
-        var switchOnly = new MenuSession();
-        switchOnly.BeginSwitchOnOpenScreen(88, false);
-        var switchPlan = switchOnly.BeginClose();
-        Check(switchPlan.SwitchOnly, "a switch-only session restores the previous category");
-        Check(!switchPlan.OpenedPause, "a switch-only session never closes the pause menu");
-        Check(switchPlan.PreviousCategoryToken == 88, "the switch-only close remembers its category");
-        switchOnly.EndClose();
-        Check(switchOnly.PreviousCategoryToken == 0 && !switchOnly.SwitchOnly,
-            "ending a close clears the ownership it consumed");
-
-        // A cancelled close keeps the ownership it still has to undo.
-        var cancelled = new MenuSession();
-        cancelled.BeginOpenFromGameplay(0, 66, true);
-        cancelled.PauseOpened();
-        cancelled.RequestPending(0);
-        cancelled.PendingResolved();
-        var firstPlan = cancelled.BeginClose();
-        Check(firstPlan.OpenedPause && cancelled.IsClosing, "a gameplay close owns the pause menu");
-        cancelled.CancelClose();
-        Check(!cancelled.IsClosing, "a cancelled close is no longer in progress");
-        Check(cancelled.OpenedPause && cancelled.PreviousCategoryToken == 66,
-            "a cancelled close keeps the pause and category ownership for the next attempt");
-        var retryPlan = cancelled.BeginClose();
-        Check(retryPlan.OpenedPause && retryPlan.PreviousCategoryToken == 66,
-            "the next close attempt sees the same ownership");
-        cancelled.EndClose();
-        Check(!cancelled.OpenedPause && !cancelled.IsClosing && cancelled.PreviousCategoryToken == 0,
-            "a completed close clears ownership");
-
-        // Reset clears everything.
-        session.Reset();
-        Check(!session.PendingShow && !session.OpenedPause && !session.IsClosing,
-            "a reset clears pending and ownership state");
-    }
-
     private static void CheckPresentationExtent()
     {
         var eye = new InputSize(1280, 720);
@@ -572,7 +517,8 @@ internal static class Program
 
     private static void CheckCategoryColumnLayout()
     {
-        // Nine categories (eight stock plus NVIDIA DLSS) inside the stock column.
+        // Nine categories (eight stock plus NVIDIA DLSS) inside the stock column. The 11-slot case
+        // below also covers the two injected Neural Rendering pages.
         const float top = 300f;
         const float bottom = -300f;
         const float pitch = 600f / 9f;
@@ -591,6 +537,25 @@ internal static class Program
         for (var i = 1; i < 9; i++)
             Check(centers[i - 1] - heights[i - 1] * 0.5f >= centers[i] + heights[i] * 0.5f - 1e-4f,
                 $"category slots {i - 1} and {i} do not overlap");
+
+        // Eleven tabs (eight stock, NVIDIA DLSS and the two Neural pages) share the same column.
+        const float widePitch = 600f / 11f;
+        var wideCenters = new float[11];
+        var wideHeights = new float[11];
+        for (var i = 0; i < 11; i++)
+        {
+            Check(CategoryColumnLayout.TryGetSlot(top, bottom, 60f, 11, i, out wideCenters[i], out wideHeights[i]),
+                $"eleven-tab slot {i} resolves");
+            Near(wideCenters[i], top - widePitch * (i + 0.5f), $"eleven-tab slot {i} centre");
+            Near(wideHeights[i], widePitch, $"eleven-tab slot {i} uses the smaller pitch");
+            Check(wideCenters[i] + wideHeights[i] * 0.5f <= top + 1e-4f &&
+                  wideCenters[i] - wideHeights[i] * 0.5f >= bottom - 1e-4f,
+                $"eleven-tab slot {i} stays inside the column");
+        }
+        for (var i = 1; i < 11; i++)
+            Check(wideCenters[i - 1] - wideHeights[i - 1] * 0.5f >=
+                  wideCenters[i] + wideHeights[i] * 0.5f - 1e-4f,
+                $"eleven-tab slots {i - 1} and {i} do not overlap");
 
         // A taller original button is clamped to the pitch instead of crossing into its neighbour.
         for (var i = 0; i < 9; i++)
@@ -1129,6 +1094,65 @@ internal static class Program
             "the localized decimal separator is preserved with the total appended once");
     }
 
+    private static void CheckHudPlacement()
+    {
+        // Stock HUD: the nearest visible edge is 10; the right-aligned rect's zero left gap is irrelevant.
+        Check(HudPlacement.TryResolveInset(500f, 28f, 200f, 10f, 16f, 400f, out var inset),
+            "a stock margin resolves");
+        Near(inset, 10f, "the smallest stock edge wins");
+
+        Check(HudPlacement.TryResolveInset(0f, 0f, 0f, 0f, 16f, 400f, out inset),
+            "a flush stock rectangle resolves");
+        Near(inset, 16f, "a flush stock rectangle uses the fallback margin");
+
+        Check(HudPlacement.TryResolveInset(0.5f, 2f, 3f, 4f, 16f, 400f, out inset),
+            "sub-unit gaps resolve");
+        Near(inset, 16f, "sub-unit gaps are measurement noise");
+
+        Check(HudPlacement.TryResolveInset(float.NaN, -1f, float.PositiveInfinity, -2f, 16f, 400f,
+                out inset), "unusable gaps resolve");
+        Near(inset, 16f, "unusable gaps use the fallback margin");
+
+        Check(HudPlacement.TryResolveInset(300f, 300f, 300f, 300f, 16f, 40f, out inset),
+            "a huge stock margin is bounded");
+        Near(inset, 40f, "the margin is clamped to the view");
+
+        Check(!HudPlacement.TryResolveInset(10f, 10f, 10f, 10f, 0f, 40f, out _),
+            "a non-positive fallback is rejected");
+        Check(!HudPlacement.TryResolveInset(10f, 10f, 10f, 10f, 16f, float.NaN, out _),
+            "a non-finite maximum is rejected");
+
+        Check(HudPlacement.TryGetRows(0f, 0f, 100f, 50f, 16f, 2, 10f,
+                out var left, out var bottom, out var width, out var height),
+            "a row rectangle resolves");
+        Near(left, 16f, "row left uses the margin");
+        Near(bottom, 16f, "row bottom uses the margin");
+        Near(width, 68f, "row width keeps both margins");
+        Near(height, 20f, "row height keeps both lines");
+        Near(left + width, 84f, "row right keeps the margin");
+
+        var invalid = new (float MinX, float MinY, float Width, float Height, float Inset, int Lines,
+            float LineHeight)[]
+        {
+            (float.NaN, 0f, 100f, 50f, 16f, 2, 10f),
+            (0f, 0f, 0f, 50f, 16f, 2, 10f),
+            (0f, 0f, 100f, -1f, 16f, 2, 10f),
+            (0f, 0f, 100f, 50f, float.NaN, 2, 10f),
+            (0f, 0f, 100f, 50f, -1f, 2, 10f),
+            (0f, 0f, 100f, 50f, 16f, 0, 10f),
+            (0f, 0f, 100f, 50f, 16f, 2, 0f),
+        };
+        foreach (var input in invalid)
+        {
+            var accepted = HudPlacement.TryGetRows(input.MinX, input.MinY, input.Width, input.Height,
+                input.Inset, input.Lines, input.LineHeight,
+                out var l, out var b, out var w, out var h);
+            Check(!accepted && l == 0f && b == 0f && w == 0f && h == 0f,
+                $"invalid row geometry is rejected ({input.MinX},{input.MinY},{input.Width}," +
+                $"{input.Height},{input.Inset},{input.Lines},{input.LineHeight})");
+        }
+    }
+
     /// <summary>A telemetry instance holding one completed window of 100 presented frames per second.</summary>
     private static HudTelemetry MeasuredWindow(uint generation, FrameGenerationKind provider, int multiplier)
     {
@@ -1200,6 +1224,72 @@ internal static class Program
     }
 
     /// <summary>
+    /// The managed restart predictor must mirror the native transport exactly: a normal family may
+    /// migrate to ANR in place, every other change after a claim needs a restart, and Off is free.
+    /// </summary>
+    private static void CheckFrameGenerationFamily()
+    {
+        Check(NativeFg.FamilyUnused == 0, "the unused family code mirrors the native macro");
+        Check(NativeFg.FamilyNormal == 1, "the normal family code mirrors the native macro");
+        Check(NativeFg.FamilyAnr == 2, "the ANR family code mirrors the native macro");
+        Check(NativeFg.FamilyStreamline == 3, "the streamline family code mirrors the native macro");
+
+        foreach (var requested in new[]
+                 {
+                     FrameGenerationKind.Off, FrameGenerationKind.Nvidia, FrameGenerationKind.Fsr,
+                     FrameGenerationKind.XeSs, FrameGenerationKind.Anr, FrameGenerationKind.Streamline,
+                 })
+        {
+            Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyUnused, requested),
+                $"an unclaimed process accepts {requested} in place");
+        }
+
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Off),
+            "Off needs no restart in the normal family");
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Off),
+            "Off needs no restart in the ANR family");
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.Off),
+            "Off needs no restart in the streamline family");
+
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Nvidia),
+            "the normal family accepts NVIDIA in place");
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Fsr),
+            "the normal family accepts FSR in place");
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.XeSs),
+            "the normal family accepts XeSS in place");
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Anr),
+            "the normal family migrates to ANR in place");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Streamline),
+            "the normal family cannot load streamline without a restart");
+
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Anr),
+            "the ANR family stays on ANR without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Nvidia),
+            "ANR refuses NVIDIA without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Fsr),
+            "ANR refuses FSR without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.XeSs),
+            "ANR refuses XeSS without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Streamline),
+            "ANR refuses streamline without a restart");
+
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.Streamline),
+            "the streamline family stays on streamline without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.Nvidia),
+            "streamline refuses NVIDIA without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.Fsr),
+            "streamline refuses FSR without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.XeSs),
+            "streamline refuses XeSS without a restart");
+        Check(FrameGenerationFamily.RestartRequired(NativeFg.FamilyStreamline, FrameGenerationKind.Anr),
+            "streamline refuses ANR without a restart");
+
+        Check(!FrameGenerationFamily.RestartRequired(NativeFg.FamilyNormal, FrameGenerationKind.Anr) &&
+              FrameGenerationFamily.RestartRequired(NativeFg.FamilyAnr, FrameGenerationKind.Fsr),
+            "the migration is one-way: normal -> ANR is free and ANR -> FSR needs a restart");
+    }
+
+    /// <summary>
     /// The multiplier row may only offer totals the provider has proven. A provider that has not
     /// answered yet (or answered 2x) is 2x, which is the XeSS regression: it offers one
     /// interpolation only, so 6x is never selectable there.
@@ -1212,18 +1302,235 @@ internal static class Program
             "a provider that proved 2x offers only 2x");
         Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Nvidia, 6) == 6,
             "a provider that proved 6x offers 6x");
-        Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Anr, 6) == 6,
-            "ANR keeps its proven 6x");
+        Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Anr, 6) == 2,
+            "ANR is capped at its 2x one-generated-frame maximum");
+        Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Anr, 2) == 2,
+            "ANR that proved 2x stays at 2x");
+        Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Anr, 0) == 2,
+            "ANR before proof offers only 2x");
+        Check(UpscalingModes.ProviderMultiplierLimit(FrameGenerationKind.Anr) == 2,
+            "ANR's fixed multiplier limit is 2x");
         Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Nvidia, 9) == 6,
             "the ceiling never exceeds the 6x the runtime can present");
         Check(UpscalingModes.FrameMultiplierCeiling(FrameGenerationKind.Off, 6) == 0,
             "a disabled provider offers nothing");
     }
 
+    private static void CheckNeuralRendering()
+    {
+        // Display order and wire values are shared by the panel, the config repair and the native
+        // feature parameters, so a renumber here changes what the game sends to NGX.
+        var styles = NeuralRenderingModes.StyleOrder;
+        Check(styles.Length == 3, $"style order must list 3 values, got {styles.Length}");
+        Check(styles[0] == NeuralRenderingStyle.Default && (int)styles[0] == 0, "style wire value 0 is Default");
+        Check(styles[1] == NeuralRenderingStyle.Natural && (int)styles[1] == 1, "style wire value 1 is Natural");
+        Check(styles[2] == NeuralRenderingStyle.Cinematic && (int)styles[2] == 2, "style wire value 2 is Cinematic");
+
+        var timings = NeuralRenderingModes.TimingOrder;
+        Check(timings.Length == 2, $"timing order must list 2 values, got {timings.Length}");
+        Check(timings[0] == NeuralRenderingTiming.BeforeUpscaling && (int)timings[0] == 0,
+            "timing wire value 0 is BeforeUpscaling");
+        Check(timings[1] == NeuralRenderingTiming.AfterUpscaling && (int)timings[1] == 1,
+            "timing wire value 1 is AfterUpscaling");
+
+        Check(NeuralRenderingModes.Name(NeuralRenderingStyle.Default) == "Default", "style 0 is labelled Default");
+        Check(NeuralRenderingModes.Name(NeuralRenderingStyle.Natural) == "Natural", "style 1 is labelled Natural");
+        Check(NeuralRenderingModes.Name(NeuralRenderingStyle.Cinematic) == "Cinematic", "style 2 is labelled Cinematic");
+        Check(NeuralRenderingModes.Name(NeuralRenderingTiming.BeforeUpscaling) == "Before Upscaling",
+            "pre-upscale timing is labelled Before Upscaling");
+        Check(NeuralRenderingModes.Name(NeuralRenderingTiming.AfterUpscaling) == "After Upscaling",
+            "post-upscale timing is labelled After Upscaling");
+
+        Check(NeuralRenderingModes.MinPasses == 1, "the minimum pass count is 1");
+        Check(NeuralRenderingModes.MaxPasses == 5, "the maximum pass count is 5");
+        Check(NeuralRenderingModes.ClampPasses(0) == 1, "zero passes clamp up to 1");
+        Check(NeuralRenderingModes.ClampPasses(1) == 1, "one pass stays 1");
+        Check(NeuralRenderingModes.ClampPasses(5) == 5, "five passes stay 5");
+        Check(NeuralRenderingModes.ClampPasses(6) == 5, "six passes clamp down to 5");
+        Check(NeuralRenderingModes.ClampPasses(int.MinValue) == 1, "the smallest int clamps to 1");
+        Check(NeuralRenderingModes.ClampPasses(int.MaxValue) == 5, "the largest int clamps to 5");
+
+        Check(NeuralRenderingModes.ClampUnit(float.NaN) == 1f, "a NaN unit value falls back to 1");
+        Check(NeuralRenderingModes.ClampUnit(float.PositiveInfinity) == 1f,
+            "positive infinity falls back to 1");
+        Check(NeuralRenderingModes.ClampUnit(float.NegativeInfinity) == 1f,
+            "negative infinity falls back to 1");
+        Check(NeuralRenderingModes.ClampUnit(-1f) == 0f, "a negative unit value clamps to 0");
+        Check(NeuralRenderingModes.ClampUnit(0f) == 0f, "zero stays 0");
+        Check(NeuralRenderingModes.ClampUnit(1f) == 1f, "one stays 1");
+        Check(NeuralRenderingModes.ClampUnit(2f) == 2f, "two stays 2");
+        Check(NeuralRenderingModes.ClampUnit(9f) == 2f, "a value above the range clamps to 2");
+        Check(NeuralRenderingModes.ClampUnit(float.NaN, 0.5f) == 0.5f,
+            "a NaN unit value uses the supplied fallback");
+
+        static void CheckRows(NeuralRenderingPage page,
+            (string Key, string Caption, NeuralRenderingRowKind Kind)[] expected, string label)
+        {
+            Check(page.Rows.Length == expected.Length,
+                $"the {label} page declares {expected.Length} rows, got {page.Rows.Length}");
+            for (var i = 0; i < expected.Length && i < page.Rows.Length; i++)
+            {
+                var row = page.Rows[i];
+                Check(row.Key == expected[i].Key && row.Caption == expected[i].Caption &&
+                      row.Kind == expected[i].Kind,
+                    $"{label} row {i} must be {expected[i].Caption}/{expected[i].Kind}");
+            }
+        }
+
+        var pages = NeuralRenderingSchema.Pages;
+        Check(pages.Length == 2, $"the Neural Rendering schema declares 2 pages, got {pages.Length}");
+        if (pages.Length == 2)
+        {
+            var first = pages[0];
+            Check(first.Label == NeuralRenderingSchema.CategoryLabel && first.Label == "Neural Rendering",
+                "the first page caption is Neural Rendering");
+            Check(first.SettingsObjectName == "BigScale.NeuralSettings",
+                "the first page root is BigScale.NeuralSettings");
+            Check(first.CategoryObjectName == "BigScale.NeuralCategory",
+                "the first page tab is BigScale.NeuralCategory");
+            CheckRows(first, new (string Key, string Caption, NeuralRenderingRowKind Kind)[]
+            {
+                (NeuralRenderingSchema.EnabledKey, "Enabled", NeuralRenderingRowKind.Toggle),
+                (NeuralRenderingSchema.PresetKey, "Preset", NeuralRenderingRowKind.Choice),
+                (NeuralRenderingSchema.TimingKey, "Timing", NeuralRenderingRowKind.Choice),
+                (NeuralRenderingSchema.PassesKey, "Passes", NeuralRenderingRowKind.Integer),
+                (NeuralRenderingSchema.StatusKey, "Status", NeuralRenderingRowKind.Status),
+            }, "Neural Rendering");
+
+            var second = pages[1];
+            Check(second.Label == NeuralRenderingSchema.TuningLabel && second.Label == "Neural Tuning",
+                "the second page caption is Neural Tuning");
+            Check(second.SettingsObjectName == "BigScale.NeuralTuningSettings",
+                "the second page root is BigScale.NeuralTuningSettings");
+            Check(second.CategoryObjectName == "BigScale.NeuralTuningCategory",
+                "the second page tab is BigScale.NeuralTuningCategory");
+            CheckRows(second, new (string Key, string Caption, NeuralRenderingRowKind Kind)[]
+            {
+                (NeuralRenderingSchema.StrengthKey, "Strength", NeuralRenderingRowKind.Slider),
+                (NeuralRenderingSchema.DetailKey, "Detail", NeuralRenderingRowKind.Slider),
+                (NeuralRenderingSchema.ToneKey, "Tone", NeuralRenderingRowKind.Slider),
+                (NeuralRenderingSchema.CharacterMaskKey, "Character Masking", NeuralRenderingRowKind.Toggle),
+            }, "Neural Tuning");
+        }
+
+        var flat = new List<NeuralRenderingRow>();
+        foreach (var page in pages) flat.AddRange(page.Rows);
+        Check(flat.Count == 9, $"the two Neural pages declare 9 rows in total, got {flat.Count}");
+        var keys = new HashSet<string>();
+        foreach (var row in flat) keys.Add(row.Key);
+        Check(keys.Count == flat.Count, $"the nine Neural rows use unique keys, got {keys.Count}");
+        foreach (var row in flat)
+        {
+            if (row.Kind == NeuralRenderingRowKind.Slider)
+            {
+                Check(row.Min == 0f && row.Max == 2f,
+                    $"{row.Caption} slider range must be 0..2, got {row.Min}..{row.Max}");
+            }
+            else
+            {
+                Check(row.Min == 0f && row.Max == 0f,
+                    $"{row.Caption} is not a slider and must carry no range");
+            }
+        }
+
+        Check(NeuralRenderingStatusText.For(false, true, UpscalerKind.Dlss, NeuralRenderingState.Active) == "Off",
+            "the disabled gate reads Off even with the master switch on");
+        Check(NeuralRenderingStatusText.For(true, false, UpscalerKind.Dlss, NeuralRenderingState.Active) == "Off",
+            "the master switch off reads Off");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Off, NeuralRenderingState.Active) ==
+              "Select an Upscaler", "an Off upscaler asks for a selection");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.Waiting) == "Waiting",
+            "a waiting native state reads Waiting");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.Active) == "Active",
+            "an active native state reads Active");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.RuntimeMissing) ==
+              "Runtime missing", "a missing runtime reads Runtime missing");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.Failed) == "Failed",
+            "a failed native state reads Failed");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.Unsupported) ==
+              "Unsupported (desktop only)", "an unsupported packet layout names its desktop-only limit");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, NeuralRenderingState.Off) == "Waiting",
+            "a stale Off native state reads Waiting rather than claiming success");
+        Check(NeuralRenderingStatusText.For(true, true, UpscalerKind.Dlss, 99) == "Waiting",
+            "an unknown native state reads Waiting");
+    }
+
+    private static void CheckCharacterMaskPolicy()
+    {
+        var builtIns = CharacterMaskPolicy.DefaultShaderNames;
+        Check(builtIns.Length == 2, $"the built-in character shader list must hold 2 names, got {builtIns.Length}");
+        Check(builtIns[0] == "househouse/PlayerCharacter" && builtIns[1] == "househouse/PlayerNose",
+            "the built-in character shader names are unchanged");
+
+        var none = Array.Empty<string>();
+        Check(CharacterMaskPolicy.IsCharacterShader("househouse/PlayerCharacter", none),
+            "the player body shader is a character shader");
+        Check(CharacterMaskPolicy.IsCharacterShader("househouse/PlayerNose", none),
+            "the player nose shader is a character shader");
+        Check(CharacterMaskPolicy.IsCharacterShader("HOUSEHOUSE/PLAYERCHARACTER", none),
+            "the built-in match is case-insensitive");
+        Check(CharacterMaskPolicy.IsCharacterShader("househouse/PlayerCharacterAlt", none),
+            "a variant name containing the built-in is a character shader");
+        Check(CharacterMaskPolicy.IsCharacterShader("x/househouse/playerNose.y", none),
+            "the match is a substring, not a whole name");
+        Check(!CharacterMaskPolicy.IsCharacterShader("Universal Render Pipeline/Lit", none),
+            "an environment shader is not a character shader");
+        Check(!CharacterMaskPolicy.IsCharacterShader(null, none), "a null shader name matches nothing");
+        Check(!CharacterMaskPolicy.IsCharacterShader(string.Empty, none), "an empty shader name matches nothing");
+        Check(!CharacterMaskPolicy.IsCharacterShader("   ", none), "a whitespace shader name matches nothing");
+
+        Check(CharacterMaskPolicy.IsCharacterShader("Custom/Variant/SkinPass", new[] { "Variant/Skin" }),
+            "an extra shader name protects a variant");
+        Check(CharacterMaskPolicy.IsCharacterShader("x/variant/skin.y", new[] { "Variant/Skin" }),
+            "an extra shader name matches case-insensitively");
+        Check(!CharacterMaskPolicy.IsCharacterShader("Universal Render Pipeline/Lit", null!),
+            "a null extra list matches nothing");
+        Check(!CharacterMaskPolicy.IsCharacterShader("Universal Render Pipeline/Lit",
+                new[] { (string)null!, string.Empty, "   " }),
+            "null, empty and whitespace extras are skipped");
+        Check(!CharacterMaskPolicy.IsCharacterShader("Universal Render Pipeline/Lit", new[] { string.Empty }),
+            "an empty extra is not a wildcard");
+
+        Check(CharacterMaskPolicy.LocalNoseShaderName == builtIns[1],
+            "the local nose constant is the built-in nose shader");
+        const int cameraMask = ~(1 << 9); // the local camera leaves out HideOnLocalCamera
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(cameraMask, 9, true, true, false, false),
+            "a renderer on the camera-hidden layer 9 is not drawn");
+        Check(CharacterMaskPolicy.IsDrawnByCamera(cameraMask, 0, true, true, false, false),
+            "a visible-layer renderer is drawn");
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(-1, 0, false, true, false, false),
+            "a disabled renderer is not drawn");
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(-1, 0, true, false, false, false),
+            "an inactive renderer is not drawn");
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(-1, 0, true, true, true, false),
+            "a force-hidden renderer is not drawn");
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(-1, 0, true, true, false, true),
+            "a shadow-only renderer is not drawn");
+        Check(!CharacterMaskPolicy.IsDrawnByCamera(-1, 32, true, true, false, false) &&
+              !CharacterMaskPolicy.IsDrawnByCamera(-1, -1, true, true, false, false),
+            "an out-of-range layer is not drawn");
+
+        var on3 = new[] { true, true, true };
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "ShadowCaster", "DepthOnly", "UniversalForward" }, on3) == 2,
+            "the forward pass is chosen over depth and shadow passes");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "SRPDefaultUnlit", "UniversalForward" }, new[] { true, true }) == 1,
+            "UniversalForward beats an extra unlit pass");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { null, "ShadowCaster" }, new[] { true, true }) == 0,
+            "an untagged pass counts as SRPDefaultUnlit");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "UniversalForward", "UniversalForwardOnly" }, new[] { false, true }) == 1,
+            "a disabled forward pass is skipped");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "ShadowCaster", "DepthOnly", "MotionVectors" }, on3) == -1,
+            "no forward pass");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "universalforward" }, new[] { true }) == 0,
+            "tags compare case-insensitively");
+        Check(CharacterMaskPolicy.SelectForwardPass(new[] { "UniversalForward" }, new[] { true, false }) == -1,
+            "mismatched lengths");
+    }
+
     private static void CheckAbi()
     {
-        Check(Native.AbiVersion == 4, "the bridge ABI is version 4");
-        Check(Marshal.SizeOf<Native.Frame>() == 176, $"managed Frame size must be 176, got {Marshal.SizeOf<Native.Frame>()}");
+        Check(Native.AbiVersion == 5, "the bridge ABI is version 5");
+        Check(Marshal.SizeOf<Native.Frame>() == 192, $"managed Frame size must be 192, got {Marshal.SizeOf<Native.Frame>()}");
         Check(Marshal.SizeOf<Native.Status>() == 1176, $"managed Status size must be 1176, got {Marshal.SizeOf<Native.Status>()}");
         Check(Marshal.SizeOf<Native.ModeInfo>() == 32, "managed ModeInfo size must be 32");
         Check(Marshal.SizeOf<Native.ViewInfo>() == 24, "managed ViewInfo size must be 24");
@@ -1237,11 +1544,18 @@ internal static class Program
         Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.CameraNear)).ToInt64() == 152, "Frame.CameraNear offset");
         Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.PreExposure)).ToInt64() == 164, "Frame.PreExposure offset");
         Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.FgCaptureTag)).ToInt64() == 168, "Frame.FgCaptureTag offset");
+        Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.NeuralMask)).ToInt64() == 176, "Frame.NeuralMask offset");
+        Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.NeuralMaskWidth)).ToInt64() == 184,
+            "Frame.NeuralMaskWidth offset");
+        Check(Marshal.OffsetOf<Native.Frame>(nameof(Native.Frame.NeuralMaskHeight)).ToInt64() == 188,
+            "Frame.NeuralMaskHeight offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.TotalEvaluations)).ToInt64() == 48, "Status.TotalEvaluations offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.Mode0)).ToInt64() == 64, "Status.Mode0 offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.Mode4)).ToInt64() == 192, "Status.Mode4 offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.View0)).ToInt64() == 224, "Status.View0 offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.ViewCount)).ToInt64() == 272, "Status.ViewCount offset");
+        Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.NeuralState)).ToInt64() == 284,
+            "Status.NeuralState offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.CompletionPublished)).ToInt64() == 288, "Status.CompletionPublished offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.CompletionBase)).ToInt64() == 292, "Status.CompletionBase offset");
         Check(Marshal.OffsetOf<Native.Status>(nameof(Native.Status.Completion0)).ToInt64() == 296, "Status.Completion0 offset");
@@ -1254,9 +1568,38 @@ internal static class Program
         Check(Marshal.OffsetOf<Native.Completion>(nameof(Native.Completion.Result)).ToInt64() == 32, "Completion.Result offset");
         Check(Marshal.OffsetOf<Native.Completion>(nameof(Native.Completion.Upscaler)).ToInt64() == 52, "Completion.Upscaler offset");
         Check(Marshal.OffsetOf<Native.Completion>(nameof(Native.Completion.SliceCount)).ToInt64() == 68, "Completion.SliceCount offset");
-        Check(Native.FrameFieldOrder.Length == 39, $"frame field order table must list 39 fields, got {Native.FrameFieldOrder.Length}");
+        Check(Native.FrameFieldOrder.Length == 42, $"frame field order table must list 42 fields, got {Native.FrameFieldOrder.Length}");
         Check(Native.CompletionFieldOrder.Length == 19, "completion field order table lists 19 fields");
         Check(Native.StatusFieldOrder.Length == 40, "status field order table lists 40 fields");
+        Check(Native.StatusFieldOrder.Contains(nameof(Native.Status.NeuralState)),
+            "the status field order table carries the neural state");
+        Check(!Native.StatusFieldOrder.Contains("Reserved"),
+            "the status field order table no longer carries a Reserved field");
+        Check(Native.NeuralAbiVersion == 1, "the Neural Rendering ABI is version 1");
+        Check(Marshal.SizeOf<Native.NeuralConfig>() == 44,
+            $"managed NeuralConfig size must be 44, got {Marshal.SizeOf<Native.NeuralConfig>()}");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Abi)).ToInt64() == 0,
+            "NeuralConfig.Abi offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Size)).ToInt64() == 4,
+            "NeuralConfig.Size offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Enabled)).ToInt64() == 8,
+            "NeuralConfig.Enabled offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Style)).ToInt64() == 12,
+            "NeuralConfig.Style offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Timing)).ToInt64() == 16,
+            "NeuralConfig.Timing offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Passes)).ToInt64() == 20,
+            "NeuralConfig.Passes offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Strength)).ToInt64() == 24,
+            "NeuralConfig.Strength offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Detail)).ToInt64() == 28,
+            "NeuralConfig.Detail offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Tone)).ToInt64() == 32,
+            "NeuralConfig.Tone offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.CharacterMask)).ToInt64() == 36,
+            "NeuralConfig.CharacterMask offset");
+        Check(Marshal.OffsetOf<Native.NeuralConfig>(nameof(Native.NeuralConfig.Reserved)).ToInt64() == 40,
+            "NeuralConfig.Reserved offset");
         Check(NativeFg.AbiVersion == 7, "the frame-generation ABI is version 7");
         Check(Marshal.SizeOf<NativeFg.Config>() == 40, "managed FG config size must be 40");
         Check(Marshal.SizeOf<NativeFg.Frame>() == 424, "managed FG frame size must be 424");

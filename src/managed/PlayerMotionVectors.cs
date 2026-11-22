@@ -32,7 +32,7 @@ internal sealed class PlayerMotionVectors
     private const string MotionPassName = "MotionVectors";
     private const string ForwardShader = "Universal Render Pipeline/Lit";
     // The game's first-person nose decoration: live geometry that never writes colour.
-    private const string HiddenShader = "househouse/PlayerNose";
+    private const string HiddenShader = CharacterMaskPolicy.LocalNoseShaderName;
     private const string MaterialName = "BigScale.ObjectMotion";
 
     private sealed class MotionRecord

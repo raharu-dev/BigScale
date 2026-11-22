@@ -15,9 +15,9 @@ internal sealed class PluginBehaviour : MonoBehaviour
         var instance = Plugin.Instance;
         if (instance == null) return;
 
-        // A renderer defect must never take the settings UI or the menu key down with it. The
-        // failure is reported once per distinct message; a later successful tick only re-arms that
-        // suppression, not the latched ownership fault.
+        // A renderer defect must never take the settings UI down with it. The failure is reported
+        // once per distinct message; a later successful tick only re-arms that suppression, not the
+        // latched ownership fault.
         var coordinator = instance.Coordinator;
         if (coordinator != null)
         {
@@ -45,9 +45,6 @@ internal sealed class PluginBehaviour : MonoBehaviour
             }
         }
 
-        // The menu key polls independently of renderer readiness, so the panel stays usable when
-        // BigScale is unsupported, faulted or absent.
-        instance.Menu?.Poll();
         RefreshVisiblePanel();
 
         // Big Visuals may load after this plugin, so interception is retried until it sticks.
